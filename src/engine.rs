@@ -1,4 +1,5 @@
 use mlua::{Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, StdLib, Thread};
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +14,8 @@ pub struct ToolCall {
 
 /// Describes a tool the LLM is allowed to call.
 /// Use this to register tools AND auto-generate system prompt descriptions.
-#[derive(Debug, Clone)]
+/// Derives Serialize/Deserialize so it can be stored in a SandboxSnapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     /// Human-readable description of what this tool does (used in prompt generation).
@@ -50,6 +52,43 @@ pub enum ToolResult {
     Err(String),
 }
 
+/// A serializable point-in-time snapshot of a sandbox execution session.
+///
+/// Stores everything needed to reconstruct the engine and fast-forward
+/// it to exactly the yield point it was at when the snapshot was taken.
+/// This allows resuming execution across process restarts, HTTP request
+/// boundaries, or any other stateless host environment.
+///
+/// # How it works
+///
+/// Rather than serializing the raw Lua VM state (which mlua does not
+/// expose), the snapshot records the complete *history* of the session:
+/// the original script, all completed tool result rounds, and the
+/// registration configuration. On restore, a new VM replays the script
+/// but automatically fast-forwards through every previously-resolved
+/// yield — injecting cached results instead of calling real tools —
+/// until it reaches the first *new* yield that needs real execution.
+///
+/// `ToolResult::Err` results are materialized as
+/// `{ "__error": true, "message": "..." }` JSON before storage so that
+/// replay via `resume_with_json` produces an identical Lua value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxSnapshot {
+    /// The original Lua script source exactly as passed to `execute()`.
+    pub script_source: String,
+    /// All tool result rounds that have already been resolved and injected,
+    /// in order. Each inner Vec corresponds to one `resume_with_json` or
+    /// `resume_with_results` call.
+    pub completed_tool_results: Vec<Vec<serde_json::Value>>,
+    /// The tool definitions registered before execution, needed to rebuild
+    /// the Lua function stubs in the restored engine.
+    pub tool_definitions: Vec<ToolDefinition>,
+    /// The globals injected before execution via `inject_globals()`.
+    pub injected_globals: serde_json::Value,
+    /// Any Lua library code loaded via `load_library()` before execution.
+    pub libraries: Vec<String>,
+}
+
 // ─── Sandbox ─────────────────────────────────────────────────────────────────
 
 pub struct AuwgentSandbox {
@@ -60,6 +99,21 @@ pub struct AuwgentSandbox {
     /// We apply it lazily on the first execute() call, AFTER all tools and globals
     /// have been registered on the (still mutable) globals table.
     is_locked: bool,
+
+    // ── Snapshot tracking ──────────────────────────────────────────────────────
+    // These fields accumulate the session history automatically so that
+    // snapshot() is free — callers do not need to track anything themselves.
+
+    /// The script currently being executed (set by execute()).
+    snapshot_script: Option<String>,
+    /// All tool result rounds injected so far, in order.
+    snapshot_rounds: Vec<Vec<serde_json::Value>>,
+    /// A copy of all registered ToolDefinitions for snapshot reconstruction.
+    snapshot_tools: Vec<ToolDefinition>,
+    /// A copy of all injected globals for snapshot reconstruction.
+    snapshot_globals: serde_json::Value,
+    /// A copy of all library chunks loaded via load_library().
+    snapshot_libraries: Vec<String>,
 }
 
 impl AuwgentSandbox {
@@ -146,6 +200,11 @@ impl AuwgentSandbox {
             active_thread: None,
             instr_count,
             is_locked: false,
+            snapshot_script: None,
+            snapshot_rounds: Vec::new(),
+            snapshot_tools: Vec::new(),
+            snapshot_globals: serde_json::Value::Object(serde_json::Map::new()),
+            snapshot_libraries: Vec::new(),
         })
     }
 
@@ -154,6 +213,8 @@ impl AuwgentSandbox {
     /// Inject read-only context variables into the Lua global scope.
     /// Must be called BEFORE `execute()` — after the first execution,
     /// the sandbox is locked and globals become immutable.
+    ///
+    /// All injected globals are automatically tracked for snapshot restoration.
     ///
     /// Example:
     /// ```rust,no_run
@@ -165,6 +226,15 @@ impl AuwgentSandbox {
     /// })).unwrap();
     /// ```
     pub fn inject_globals(&mut self, ctx: serde_json::Value) -> LuaResult<()> {
+        // Merge into snapshot tracker before mutating the VM
+        if let (serde_json::Value::Object(stored), serde_json::Value::Object(incoming)) =
+            (&mut self.snapshot_globals, &ctx)
+        {
+            for (k, v) in incoming {
+                stored.insert(k.clone(), v.clone());
+            }
+        }
+
         if let serde_json::Value::Object(map) = ctx {
             for (key, val) in map {
                 let lua_val = self.lua.to_value(&val)?;
@@ -177,7 +247,12 @@ impl AuwgentSandbox {
     /// Register a list of `ToolDefinition`s available to the LLM.
     /// Automatically generates idiomatic Lua function stubs for each tool.
     /// Must be called BEFORE `execute()`.
+    ///
+    /// Definitions are automatically tracked for snapshot restoration.
     pub fn register_tools(&mut self, tools: &[ToolDefinition]) -> LuaResult<()> {
+        // Track for snapshot
+        self.snapshot_tools.extend_from_slice(tools);
+
         let mut script = String::new();
         for t in tools {
             if t.has_args {
@@ -201,6 +276,20 @@ impl AuwgentSandbox {
             }
         }
         self.lua.load(&script).exec()?;
+        Ok(())
+    }
+
+    /// Load reusable Lua library code (utilities, helper functions) that the LLM
+    /// can call without needing to rewrite it in every script.
+    ///
+    /// Unlike `register_tools`, library functions are pure Lua — they run
+    /// entirely inside the VM and do not yield to the Rust host.
+    ///
+    /// Must be called BEFORE `execute()`. Library code is tracked for snapshot
+    /// restoration so helper functions are available after an engine is rebuilt.
+    pub fn load_library(&mut self, lua_code: &str) -> LuaResult<()> {
+        self.snapshot_libraries.push(lua_code.to_string());
+        self.lua.load(lua_code).exec()?;
         Ok(())
     }
 
@@ -237,6 +326,8 @@ impl AuwgentSandbox {
 
     /// Load and execute a Lua script in the sandbox.
     /// On the first call, this locks the sandbox by applying `sandbox(true)`.
+    ///
+    /// The script source is recorded internally for snapshot support.
     pub fn execute(&mut self, source: &str) -> LuaResult<ExecutionResult> {
         // Apply sandbox(true) exactly once — after registration, before execution.
         // This freezes the global table so the LLM script cannot redefine tools or print.
@@ -244,6 +335,10 @@ impl AuwgentSandbox {
             self.lua.sandbox(true)?;
             self.is_locked = true;
         }
+
+        // Record the script source and reset the round history for this execution.
+        self.snapshot_script = Some(source.to_string());
+        self.snapshot_rounds.clear();
 
         // Reset the interrupt counter for this execution window.
         self.instr_count.store(0, Ordering::Relaxed);
@@ -264,10 +359,14 @@ impl AuwgentSandbox {
     /// into the Lua coroutine stack as native Lua values.
     ///
     /// The order of `next_values` must match the order of tools that were yielded.
+    /// Results are automatically recorded for snapshot support.
     pub fn resume_with_json(
         &mut self,
         next_values: Vec<serde_json::Value>,
     ) -> LuaResult<ExecutionResult> {
+        // Record this round before injecting
+        self.snapshot_rounds.push(next_values.clone());
+
         let lua_vals: Vec<mlua::Value> = next_values
             .into_iter()
             .map(|v| self.lua.to_value(&v).unwrap_or(mlua::Value::Nil))
@@ -284,25 +383,92 @@ impl AuwgentSandbox {
     /// independently without crashing the entire script.
     ///
     /// The order of `results` must match the order of tools in the last `YieldedForTools`.
+    /// Results are materialized to `serde_json::Value` and recorded for snapshot support,
+    /// ensuring `ToolResult::Err` sentinel tables are faithfully reproduced on restore.
     pub fn resume_with_results(
         &mut self,
         results: Vec<ToolResult>,
     ) -> LuaResult<ExecutionResult> {
-        let lua_vals: Vec<mlua::Value> = results
+        // Materialize each ToolResult to a plain JSON value for storage and injection.
+        // ToolResult::Err becomes { "__error": true, "message": "..." } which,
+        // when re-injected via resume_with_json on restore, produces the same Lua table.
+        let json_vals: Vec<serde_json::Value> = results
             .into_iter()
             .map(|r| match r {
-                ToolResult::Ok(v) => self.lua.to_value(&v).unwrap_or(mlua::Value::Nil),
-                ToolResult::Err(msg) => {
-                    // Inject a sentinel table the LLM can check with `if result.__error then`
-                    let t = self.lua.create_table().expect("Could not create error table");
-                    t.set("__error", true).unwrap();
-                    t.set("message", msg).unwrap();
-                    mlua::Value::Table(t)
-                }
+                ToolResult::Ok(v) => v,
+                ToolResult::Err(msg) => serde_json::json!({ "__error": true, "message": msg }),
             })
             .collect();
 
-        self.resume_internal(MultiValue::from_vec(lua_vals))
+        // Delegate to resume_with_json which handles tracking + injection
+        self.resume_with_json(json_vals)
+    }
+
+    // ─── Snapshot API ─────────────────────────────────────────────────────────
+
+    /// Capture the current execution state as a serializable snapshot.
+    ///
+    /// The snapshot can be stored to a database, file, or any persistent medium.
+    /// Call `AuwgentSandbox::from_snapshot()` to restore the engine to this exact
+    /// point, fast-forwarding through all previously-resolved tool yields automatically.
+    ///
+    /// Returns `None` if `execute()` has not been called yet.
+    pub fn snapshot(&self) -> Option<SandboxSnapshot> {
+        Some(SandboxSnapshot {
+            script_source: self.snapshot_script.clone()?,
+            completed_tool_results: self.snapshot_rounds.clone(),
+            tool_definitions: self.snapshot_tools.clone(),
+            injected_globals: self.snapshot_globals.clone(),
+            libraries: self.snapshot_libraries.clone(),
+        })
+    }
+
+    /// Restore a sandbox from a snapshot, fast-forwarding through all previously
+    /// completed tool yield rounds to reach the next un-resolved yield point.
+    ///
+    /// # Restoration process
+    /// 1. A fresh `AuwgentSandbox` is created.
+    /// 2. Libraries, tools, and globals from the snapshot are reloaded.
+    /// 3. The original script is executed from the beginning.
+    /// 4. Every yield that has a cached result is fast-forwarded immediately
+    ///    by injecting the stored JSON — no real tools are called.
+    /// 5. The first yield with no cached result is returned to the caller
+    ///    as `ExecutionResult::YieldedForTools`, ready for real execution.
+    ///
+    /// Returns the restored engine and the current `ExecutionResult` — which
+    /// will be the next un-resolved yield, or `Finished` if the script ran
+    /// to completion from the cached history alone.
+    pub fn from_snapshot(snapshot: SandboxSnapshot) -> LuaResult<(Self, ExecutionResult)> {
+        let mut engine = AuwgentSandbox::new()?;
+
+        // Restore library functions first (before tools, following registration order)
+        for lib in &snapshot.libraries {
+            engine.load_library(lib)?;
+        }
+
+        // Restore tool stubs
+        engine.register_tools(&snapshot.tool_definitions)?;
+
+        // Restore injected global variables
+        engine.inject_globals(snapshot.injected_globals.clone())?;
+
+        // Start executing the original script from the beginning
+        let mut status = engine.execute(&snapshot.script_source)?;
+
+        // Fast-forward through every yield round that already has a cached result.
+        // We do NOT call real tools for these — we replay the stored JSON directly.
+        for cached_round in snapshot.completed_tool_results {
+            match status {
+                ExecutionResult::YieldedForTools { .. } => {
+                    status = engine.resume_with_json(cached_round)?;
+                }
+                // Script finished or errored before all caches were consumed —
+                // the snapshot may be stale or the script non-deterministic.
+                ExecutionResult::Finished { .. } | ExecutionResult::Error(_) => break,
+            }
+        }
+
+        Ok((engine, status))
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────────

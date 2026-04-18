@@ -462,6 +462,136 @@ Returns everything `print()`'d so far in the current execution. Normally you rea
 
 ---
 
+## Session Persistence & Snapshots
+
+One of the hardest problems in agentic backends is keeping an LLM's execution session alive across stateless HTTP requests. Auwgent Mode solves this with `SandboxSnapshot` — a serializable record of everything needed to rebuild the engine and fast-forward it to exactly where it left off.
+
+### How it works
+
+Instead of serializing the raw Lua VM (which is not portable), the snapshot records the **complete history** of the session:
+
+```
+execute(script)                      ← round 0 yielded
+resume_with_json(results_0)          ← round 1 yielded   [server could die here]
+resume_with_json(results_1)          ← round 2 yielded   [or here, or anywhere]
+snapshot() → SandboxSnapshot {
+    script_source:           "...",
+    completed_tool_results:  [results_0, results_1],
+    tool_definitions:        [...],
+    injected_globals:        {...},
+    libraries:               [...],
+}
+```
+
+On restore, a **new VM is built**, the script runs from the top, but every yield that already has a cached result is fast-forwarded by injecting the stored JSON — no real tools are called. The engine stops and returns control at the **first yield with no cached result**.
+
+```
+from_snapshot(snap)
+  → new VM, register tools, inject globals, load libraries
+  → execute(script) → YieldedForTools  // round 0
+  → inject results_0 immediately        // fast-forward (no real tool call)
+  → YieldedForTools                     // round 1
+  → inject results_1 immediately        // fast-forward
+  → YieldedForTools                     // round 2 ← returned to caller
+```
+
+### `engine.snapshot() -> Option<SandboxSnapshot>`
+
+Capture the current session state. Returns `None` if `execute()` has not been called yet. State is tracked automatically — no manual effort needed from the caller.
+
+```rust
+// After resolving some yields...
+let snap = engine.snapshot().unwrap();
+
+// Serialize to string for storage (Postgres, Redis, file, etc.)
+let json = serde_json::to_string(&snap).unwrap();
+db.store("session:agent_007", &json).await?;
+```
+
+### `AuwgentSandbox::from_snapshot(snap) -> LuaResult<(Self, ExecutionResult)>`
+
+Restore an engine from a snapshot. Returns the rebuilt engine and the `ExecutionResult` at the restored position — which will be either the next un-resolved `YieldedForTools` or `Finished` if all yields were already cached.
+
+```rust
+let json = db.load("session:agent_007").await?;
+let snap: SandboxSnapshot = serde_json::from_str(&json).unwrap();
+
+let (mut engine, status) = AuwgentSandbox::from_snapshot(snap).unwrap();
+
+// status is already at the next live yield — resume normally
+match status {
+    ExecutionResult::YieldedForTools { tools } => {
+        let responses = dispatch_tools(&tools).await;
+        engine.resume_with_json(responses)?;
+    }
+    ExecutionResult::Finished { .. } => { /* already done */ }
+    ExecutionResult::Error(e) => { panic!("{}", e); }
+}
+```
+
+### Real-world pattern: Stateless HTTP backend
+
+```rust
+// POST /agent/resume  { session_id, tool_results }
+async fn resume_handler(session_id: &str, results: Vec<serde_json::Value>) {
+    // 1. Load snapshot from storage
+    let json = db.load(session_id).await?;
+    let snap: SandboxSnapshot = serde_json::from_str(&json)?;
+
+    // 2. Restore engine at the correct yield point (fast-forward is automatic)
+    let (mut engine, _) = AuwgentSandbox::from_snapshot(snap)?;
+
+    // 3. Inject the new tool results
+    let status = engine.resume_with_json(results)?;
+
+    // 4. Save updated snapshot for the next request
+    let new_snap = engine.snapshot().unwrap();
+    db.store(session_id, &serde_json::to_string(&new_snap)?).await?;
+
+    // 5. Return the next yield to the frontend
+    send_response(status);
+}
+```
+
+> **Determinism requirement:** This pattern assumes the LLM script is deterministic — i.e. the same script run twice with the same inputs produces the same sequence of yields. Avoid `os.clock()` or any non-deterministic Lua globals in scripts that will be snapshotted.
+
+### `engine.load_library(lua_code: &str) -> LuaResult<()>`
+
+Load reusable Lua utility functions before execution. Unlike `register_tools`, library functions run entirely inside the VM — they do not yield to Rust and have no tool overhead.
+
+**Key benefit:** The LLM never needs to rewrite utility logic. Just load it once per engine, and the model can call it anywhere in its script.
+
+```rust
+engine.load_library(r#"
+    function format_currency(amount, symbol)
+        return symbol .. string.format("%.2f", amount)
+    end
+
+    function clamp(val, min_val, max_val)
+        return math.max(min_val, math.min(max_val, val))
+    end
+
+    function avg(list)
+        local total = 0
+        for _, v in ipairs(list) do total = total + v end
+        return total / #list
+    end
+"#).unwrap();
+```
+
+The LLM calls these as regular functions:
+
+```lua
+local prices = await_all(get_prices())
+local formatted = format_currency(prices.latest, "$")
+local smoothed   = clamp(prices.index, 0, 100)
+print("Price:", formatted, "Index:", smoothed)
+```
+
+Library code is automatically stored in `SandboxSnapshot.libraries` and reloaded on `from_snapshot()`, so utility functions are always available after restore.
+
+---
+
 ## Security Model
 
 | Threat | Mitigation |

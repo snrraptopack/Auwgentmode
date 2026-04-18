@@ -443,3 +443,262 @@ fn test_all_tools_fail_gracefully() {
         other => panic!("Expected YieldedForTools, got {:?}", other),
     }
 }
+
+// ─── Snapshot Tests ───────────────────────────────────────────────────────────
+
+/// Snapshot taken right after the first yield. On restore the engine fast-forwards
+/// through round 0 and surfaces the SECOND yield, ready for real execution.
+#[test]
+fn test_snapshot_restore_fast_forwards_to_next_yield() {
+    let tools = vec![
+        make_tool("step_a", "Step A", false, None),
+        make_tool("step_b", "Step B", false, None),
+    ];
+
+    // ── Original session ────────────────────────────────────────────────────
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine.register_tools(&tools).unwrap();
+
+    let script = r#"
+        local a = await_all(step_a())
+        local b = await_all(step_b())
+        print("A:", a.val)
+        print("B:", b.val)
+        return "done"
+    "#;
+
+    // Round 0: step_a yields
+    let status = engine.execute(script).unwrap();
+    assert!(matches!(status, ExecutionResult::YieldedForTools { .. }));
+
+    // Complete round 0
+    engine
+        .resume_with_json(vec![serde_json::json!({ "val": "alpha" })])
+        .unwrap();
+
+    // round 1 is now the active yield — snapshot HERE
+    let snap = engine.snapshot().expect("snapshot() must return Some after execute()");
+
+    // Verify snapshot contents
+    assert_eq!(snap.script_source, script);
+    assert_eq!(snap.completed_tool_results.len(), 1); // one round recorded
+    assert_eq!(snap.tool_definitions.len(), 2);
+
+    // ── Restore session ─────────────────────────────────────────────────────
+    let (mut restored, status) = AuwgentSandbox::from_snapshot(snap).unwrap();
+
+    // The engine fast-forwarded round 0 and is now sitting at round 1 (step_b)
+    match status {
+        ExecutionResult::YieldedForTools { tools } => {
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].tool_name, "step_b");
+
+            // Complete round 1 with real (or mock) data
+            match restored
+                .resume_with_json(vec![serde_json::json!({ "val": "beta" })])
+                .unwrap()
+            {
+                ExecutionResult::Finished { ret_val, console_output } => {
+                    assert_eq!(ret_val.as_deref(), Some("done"));
+                    // a.val was cached from round 0, b.val from the real resume
+                    assert!(console_output.contains("A:\talpha"));
+                    assert!(console_output.contains("B:\tbeta"));
+                }
+                other => panic!("Expected Finished, got {:?}", other),
+            }
+        }
+        other => panic!("Expected YieldedForTools after restore, got {:?}", other),
+    }
+}
+
+/// Snapshot taken after ALL yields have been completed. Restore should return
+/// Finished immediately — no further yields or tool calls needed.
+#[test]
+fn test_snapshot_restore_after_all_rounds_returns_finished() {
+    let tools = vec![make_tool("get_data", "Get data", false, None)];
+
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine.register_tools(&tools).unwrap();
+
+    let script = r#"
+        local d = await_all(get_data())
+        return d.value
+    "#;
+
+    match engine.execute(script).unwrap() {
+        ExecutionResult::YieldedForTools { .. } => {
+            engine
+                .resume_with_json(vec![serde_json::json!({ "value": "42" })])
+                .unwrap();
+        }
+        other => panic!("Expected yield, got {:?}", other),
+    }
+
+    // Snapshot AFTER the script has finished — completed_tool_results has 1 round
+    let snap = engine.snapshot().unwrap();
+    assert_eq!(snap.completed_tool_results.len(), 1);
+
+    // Restore: engine replays round 0 from cache, script reaches Finished with no new yield
+    let (_, status) = AuwgentSandbox::from_snapshot(snap).unwrap();
+    match status {
+        ExecutionResult::Finished { ret_val, .. } => {
+            assert_eq!(ret_val.as_deref(), Some("42"));
+        }
+        other => panic!("Expected Finished after full-cache restore, got {:?}", other),
+    }
+}
+
+/// Snapshot correctly preserves ToolResult::Err sentinel tables across restore.
+/// The `__error` table in round 0 must be faithfully reproduced in the restored VM.
+#[test]
+fn test_snapshot_preserves_error_sentinel_across_restore() {
+    let tools = vec![
+        make_tool("flaky_tool", "Flaky", false, None),
+        make_tool("final_tool", "Final", false, None),
+    ];
+
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine.register_tools(&tools).unwrap();
+
+    let script = r#"
+        local result = await_all(flaky_tool())
+        if result.__error then
+            print("Error captured:", result.message)
+        end
+        local b = await_all(final_tool())
+        return b.status
+    "#;
+
+    // Round 0: inject an error via ToolResult::Err
+    match engine.execute(script).unwrap() {
+        ExecutionResult::YieldedForTools { .. } => {
+            engine
+                .resume_with_results(vec![ToolResult::Err("timeout after 30s".into())])
+                .unwrap();
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Snapshot after round 0 (error round)
+    let snap = engine.snapshot().unwrap();
+
+    // Verify the error was stored as JSON sentinel, not as ToolResult enum
+    let stored = &snap.completed_tool_results[0][0];
+    assert_eq!(stored["__error"], serde_json::json!(true));
+    assert_eq!(stored["message"], serde_json::json!("timeout after 30s"));
+
+    // Restore — fast-forwards round 0 (the error), sits at final_tool yield
+    let (mut restored, status) = AuwgentSandbox::from_snapshot(snap).unwrap();
+
+    match status {
+        ExecutionResult::YieldedForTools { tools } => {
+            assert_eq!(tools[0].tool_name, "final_tool");
+
+            match restored
+                .resume_with_json(vec![serde_json::json!({ "status": "ok" })])
+                .unwrap()
+            {
+                ExecutionResult::Finished { ret_val, console_output } => {
+                    assert_eq!(ret_val.as_deref(), Some("ok"));
+                    // Proves __error table was faithfully reproduced after restore
+                    assert!(console_output.contains("Error captured:\ttimeout after 30s"));
+                }
+                other => panic!("{:?}", other),
+            }
+        }
+        other => panic!("{:?}", other),
+    }
+}
+
+/// load_library: pre-written Lua utility functions are available in the LLM
+/// script without the LLM needing to redefine them.
+#[test]
+fn test_load_library_functions_available_in_script() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+
+    // Load a utility library BEFORE the LLM script
+    engine
+        .load_library(
+            r#"
+        function format_currency(amount, symbol)
+            return symbol .. string.format("%.2f", amount)
+        end
+
+        function clamp(val, min_val, max_val)
+            return math.max(min_val, math.min(max_val, val))
+        end
+    "#,
+        )
+        .unwrap();
+
+    let script = r#"
+        local price = format_currency(19.9, "$")
+        local clamped = clamp(150, 0, 100)
+        print("Price:", price)
+        print("Clamped:", clamped)
+        return price
+    "#;
+
+    match engine.execute(script).unwrap() {
+        ExecutionResult::Finished { ret_val, console_output } => {
+            assert_eq!(ret_val.as_deref(), Some("$19.90"));
+            assert!(console_output.contains("Price:\t$19.90"));
+            assert!(console_output.contains("Clamped:\t100"));
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
+
+/// load_library functions survive snapshot/restore — they are reloaded
+/// from the snapshot.libraries Vec and available in the restored engine.
+#[test]
+fn test_load_library_survives_snapshot_restore() {
+    let tools = vec![make_tool("get_price", "Get price", false, None)];
+
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .load_library(
+            r#"
+        function format_currency(amount, symbol)
+            return symbol .. string.format("%.2f", amount)
+        end
+    "#,
+        )
+        .unwrap();
+    engine.register_tools(&tools).unwrap();
+
+    let script = r#"
+        local data = await_all(get_price())
+        return format_currency(data.price, "€")
+    "#;
+
+    match engine.execute(script).unwrap() {
+        ExecutionResult::YieldedForTools { .. } => {
+            // Snapshot before resolving
+            let snap = engine.snapshot().unwrap();
+            assert_eq!(snap.libraries.len(), 1);
+
+            // Restore — fast-forwards nothing (0 rounds completed), sits at get_price yield
+            let (mut restored, status) = AuwgentSandbox::from_snapshot(snap).unwrap();
+
+            match status {
+                ExecutionResult::YieldedForTools { tools } => {
+                    assert_eq!(tools[0].tool_name, "get_price");
+
+                    match restored
+                        .resume_with_json(vec![serde_json::json!({ "price": 9.5 })])
+                        .unwrap()
+                    {
+                        ExecutionResult::Finished { ret_val, .. } => {
+                            // format_currency must be available after restore
+                            assert_eq!(ret_val.as_deref(), Some("€9.50"));
+                        }
+                        other => panic!("{:?}", other),
+                    }
+                }
+                other => panic!("{:?}", other),
+            }
+        }
+        other => panic!("{:?}", other),
+    }
+}
