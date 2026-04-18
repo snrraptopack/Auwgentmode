@@ -168,10 +168,18 @@ fn main() {
     loop {
         match status {
             ExecutionResult::YieldedForTools { tools } => {
-                let responses = tools.iter().map(|t| {
-                    // Run your actual API call here
-                    serde_json::json!({ "condition": "Sunny", "temp": "32C" })
-                }).collect();
+                // Dispatch each tool by name — your real implementation
+                // would call actual APIs here (tokio::join! for parallel)
+                let responses: Vec<serde_json::Value> = tools
+                    .iter()
+                    .map(|t| match t.tool_name.as_str() {
+                        "get_weather" => serde_json::json!({
+                            "condition": "Sunny",
+                            "temp": "32C"
+                        }),
+                        _ => serde_json::json!({ "error": "unknown tool" }),
+                    })
+                    .collect();
                 status = engine.resume_with_json(responses).unwrap();
             }
             ExecutionResult::Finished { ret_val, console_output } => {
