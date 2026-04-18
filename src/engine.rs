@@ -38,6 +38,18 @@ pub enum ExecutionResult {
     Error(String),
 }
 
+/// The outcome of a single host-side tool execution.
+/// Use this with `resume_with_results()` to give the LLM structured
+/// success or failure feedback without crashing the entire script.
+#[derive(Debug)]
+pub enum ToolResult {
+    /// The tool succeeded. The value is injected as a Lua table into the script.
+    Ok(serde_json::Value),
+    /// The tool failed. Injected as `{ __error = true, message = "..." }` so the
+    /// LLM can check `if result.__error then` and handle gracefully.
+    Err(String),
+}
+
 // ─── Sandbox ─────────────────────────────────────────────────────────────────
 
 pub struct AuwgentSandbox {
@@ -259,6 +271,35 @@ impl AuwgentSandbox {
         let lua_vals: Vec<mlua::Value> = next_values
             .into_iter()
             .map(|v| self.lua.to_value(&v).unwrap_or(mlua::Value::Nil))
+            .collect();
+
+        self.resume_internal(MultiValue::from_vec(lua_vals))
+    }
+
+    /// Resume a suspended script with structured per-tool results that can include failures.
+    ///
+    /// Unlike `resume_with_json`, this method accepts a mix of `ToolResult::Ok` and
+    /// `ToolResult::Err`. Error results are injected as a sentinel table:
+    /// `{ __error = true, message = "..." }` so the LLM can handle each failure
+    /// independently without crashing the entire script.
+    ///
+    /// The order of `results` must match the order of tools in the last `YieldedForTools`.
+    pub fn resume_with_results(
+        &mut self,
+        results: Vec<ToolResult>,
+    ) -> LuaResult<ExecutionResult> {
+        let lua_vals: Vec<mlua::Value> = results
+            .into_iter()
+            .map(|r| match r {
+                ToolResult::Ok(v) => self.lua.to_value(&v).unwrap_or(mlua::Value::Nil),
+                ToolResult::Err(msg) => {
+                    // Inject a sentinel table the LLM can check with `if result.__error then`
+                    let t = self.lua.create_table().expect("Could not create error table");
+                    t.set("__error", true).unwrap();
+                    t.set("message", msg).unwrap();
+                    mlua::Value::Table(t)
+                }
+            })
             .collect();
 
         self.resume_internal(MultiValue::from_vec(lua_vals))

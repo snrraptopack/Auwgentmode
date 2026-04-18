@@ -20,6 +20,109 @@ Inspired by [Pydantic's Monty](https://github.com/pydantic/monty). Built for pro
 
 ---
 
+## Architecture: Host-Controlled Tool Execution
+
+This is the core design decision that makes Auwgent Mode fundamentally different from every other Lua sandbox or code-execution approach.
+
+### What conventional sandboxes do
+
+In most sandbox implementations, tools are **Rust functions bound directly inside the VM**. When the LLM calls `search_web()`, Lua synchronously invokes a real Rust closure — which may block the thread on an HTTP request, hold a database connection open, or directly touch your infrastructure.
+
+```
+[Lua VM]
+  │
+  └─► search_web()  →  [Rust function fires inside the VM]
+                              │
+                        HTTP request blocks here
+                              │
+                        Returns result to Lua
+```
+
+The VM is the executor. The host just watches.
+
+### What Auwgent Mode does
+
+In Auwgent Mode, the Lua function `search_web()` does **zero I/O**. It simply builds and returns a plain table describing *intent*:
+
+```lua
+-- This is ALL search_web() does inside the VM:
+function search_web(args)
+    return { name = "search_web", payload = args }
+end
+```
+
+When the LLM calls `await_all(search_web(...))`, the sandbox immediately **freezes entirely** via `coroutine.yield()`. The resulting intent table is handed to the Rust host. The VM sits idle, consuming nothing.
+
+```
+[Lua VM]
+  │
+  └─► search_web({ query = "rust" })
+          │
+          └─► returns { name = "search_web", payload = { query = "rust" } }
+                  │
+          await_all() yields this to Rust ──► [VM is frozen]
+                                                    │
+                                             [Rust host owns it now]
+                                                    │
+                                          ┌─────────┴──────────────┐
+                                          │ Authenticate the call   │
+                                          │ Check rate limits       │
+                                          │ Hit a cache layer       │
+                                          │ Run tokio::join!()      │
+                                          │ Log for audit trail     │
+                                          │ Cancel if needed        │
+                                          └─────────┬──────────────┘
+                                                    │
+                                          resume_with_json(result)
+                                                    │
+                                             [VM wakes up]
+                                                    │
+  local result = ...  ◄──────────────────────────────
+```
+
+### Why this matters
+
+**The host has full sovereignty over every tool call.** The VM never touches your infrastructure directly. This enables capabilities that VM-bound tool systems cannot provide:
+
+| Capability | VM-bound tools | Auwgent Mode |
+|---|---|---|
+| Parallel tool execution | ❌ Sequential by default | ✅ `tokio::join!` on every yield batch |
+| Auth / permission checks | Baked into each tool fn | ✅ Centralized in the host loop |
+| Rate limiting | Per-function implementation | ✅ One place in the host dispatch |
+| Caching | Per-function implementation | ✅ Intercept any tool by name |
+| Audit logging | Per-function implementation | ✅ Log every `ToolCall` struct |
+| Cancellation | Cannot cancel a running Rust fn | ✅ Drop the resume call |
+| Tool mocking for tests | Requires VM setup | ✅ Just return different JSON |
+
+### What the host receives
+
+When the LLM script yields, your Rust application receives a clean, typed vector of `ToolCall` structs:
+
+```rust
+pub struct ToolCall {
+    pub tool_name: String,          // "search_web"
+    pub payload: serde_json::Value, // { "query": "rust sandbox" }
+}
+```
+
+Your host dispatch loop is the only place that runs real tools:
+
+```rust
+ExecutionResult::YieldedForTools { tools } => {
+    // Run ALL yielded tools concurrently (parallel execution for free)
+    let responses: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| dispatch_tool(tool))   // your logic here
+        .collect();
+
+    status = engine.resume_with_json(responses)?;
+}
+```
+
+The result is a clean separation of concerns: **the LLM describes what it needs, Rust decides how and when to execute it.**
+
+---
+
 ## Installation
 
 Add to your `Cargo.toml`:
@@ -285,6 +388,8 @@ Returns one of:
 
 Resumes a suspended script, injecting tool results back into the Lua coroutine. The order of `responses` must match the order of tools in the last `YieldedForTools`.
 
+Use this when **all tools are guaranteed to succeed**. For mixed success/failure batches, use `resume_with_results` instead.
+
 ```rust
 ExecutionResult::YieldedForTools { tools } => {
     let mut responses = Vec::new();
@@ -299,6 +404,55 @@ ExecutionResult::YieldedForTools { tools } => {
     status = engine.resume_with_json(responses).unwrap();
 }
 ```
+
+---
+
+### `engine.resume_with_results(results: Vec<ToolResult>) -> LuaResult<ExecutionResult>`
+
+The production-grade alternative to `resume_with_json`. Accepts a mix of `ToolResult::Ok` and `ToolResult::Err` so the LLM can handle individual tool failures without crashing the entire script.
+
+**`ToolResult` variants:**
+- `ToolResult::Ok(serde_json::Value)` — injected as a normal Lua table
+- `ToolResult::Err(String)` — injected as `{ __error = true, message = "..." }`
+
+```rust
+ExecutionResult::YieldedForTools { tools } => {
+    let results: Vec<ToolResult> = tools.iter().map(|tool| {
+        match call_tool(&tool.tool_name, &tool.payload) {
+            Ok(data)  => ToolResult::Ok(data),
+            Err(e)    => ToolResult::Err(e.to_string()),
+        }
+    }).collect();
+
+    status = engine.resume_with_results(results).unwrap();
+}
+```
+
+The LLM checks failures using the `__error` sentinel field:
+
+```lua
+local weather, stocks, news = await_all(
+    get_weather({ location = "NY" }),
+    get_stocks({ ticker = "AAPL" }),
+    get_news()
+)
+
+-- Handle individual failures without crashing
+if stocks.__error then
+    print("Stocks unavailable:", stocks.message)
+else
+    print("Price:", stocks.price)
+end
+
+-- Other results are unaffected
+print("Weather:", weather.condition)
+print("News:", news.headline)
+```
+
+> **Why `__error` and not `pcall`?**
+> LLMs are generally unreliable at writing correct `pcall`/`xpcall` error handling in Lua.
+> The `__error` sentinel mirrors the `{ "error": "..." }` pattern LLMs already know from REST API responses,
+> making it far more likely the model will handle errors correctly and consistently.
 
 ---
 

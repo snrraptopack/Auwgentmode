@@ -341,3 +341,105 @@ fn test_sandbox_default_trait() {
         other => panic!("Expected Finished, got {:?}", other),
     }
 }
+
+/// Partial failure: three tools yielded, one fails — script handles it via __error sentinel.
+/// The other two tools must still succeed and be accessible to the script.
+#[test]
+fn test_partial_tool_failure_via_tool_result() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[
+            make_tool("get_weather", "Get weather", true, None),
+            make_tool("get_stocks", "Get stocks", true, None),
+            make_tool("get_news", "Get news", false, None),
+        ])
+        .unwrap();
+
+    // The LLM calls three tools in one await_all.
+    // It handles failures gracefully using the __error sentinel.
+    let script = r#"
+        local weather, stocks, news = await_all(
+            get_weather({ location = "NY" }),
+            get_stocks({ ticker = "AAPL" }),
+            get_news()
+        )
+
+        if stocks.__error then
+            print("Stocks failed:", stocks.message)
+        else
+            print("Stock price:", stocks.price)
+        end
+
+        print("Weather:", weather.condition)
+        print("News:", news.headline)
+        return "handled"
+    "#;
+
+    match engine.execute(script).unwrap() {
+        ExecutionResult::YieldedForTools { tools } => {
+            assert_eq!(tools.len(), 3);
+
+            // Tool 1 succeeds, Tool 2 fails (rate limited), Tool 3 succeeds
+            let results = vec![
+                ToolResult::Ok(serde_json::json!({ "condition": "Sunny" })),
+                ToolResult::Err("Rate limited: retry in 60s".into()),
+                ToolResult::Ok(serde_json::json!({ "headline": "Rust is amazing" })),
+            ];
+
+            match engine.resume_with_results(results).unwrap() {
+                ExecutionResult::Finished { ret_val, console_output } => {
+                    assert_eq!(ret_val.as_deref(), Some("handled"));
+                    // Error was handled gracefully — not a crash
+                    assert!(console_output.contains("Stocks failed:"));
+                    assert!(console_output.contains("Rate limited: retry in 60s"));
+                    // Other two tools still delivered their values correctly
+                    assert!(console_output.contains("Weather:\tSunny"));
+                    assert!(console_output.contains("News:\tRust is amazing"));
+                }
+                other => panic!("Expected Finished, got {:?}", other),
+            }
+        }
+        other => panic!("Expected YieldedForTools, got {:?}", other),
+    }
+}
+
+/// All tools fail: script handles every __error in a batch.
+#[test]
+fn test_all_tools_fail_gracefully() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[
+            make_tool("get_data_a", "Data A", false, None),
+            make_tool("get_data_b", "Data B", false, None),
+        ])
+        .unwrap();
+
+    let script = r#"
+        local a, b = await_all(get_data_a(), get_data_b())
+
+        local errors = 0
+        if a.__error then errors = errors + 1 end
+        if b.__error then errors = errors + 1 end
+
+        print("Total errors:", errors)
+        return tostring(errors)
+    "#;
+
+    match engine.execute(script).unwrap() {
+        ExecutionResult::YieldedForTools { .. } => {
+            let results = vec![
+                ToolResult::Err("Service A is down".into()),
+                ToolResult::Err("Service B is down".into()),
+            ];
+
+            match engine.resume_with_results(results).unwrap() {
+                ExecutionResult::Finished { ret_val, console_output } => {
+                    assert_eq!(ret_val.as_deref(), Some("2"));
+                    assert!(console_output.contains("Total errors:\t2"));
+                }
+                other => panic!("Expected Finished, got {:?}", other),
+            }
+        }
+        other => panic!("Expected YieldedForTools, got {:?}", other),
+    }
+}
