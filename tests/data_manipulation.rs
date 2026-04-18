@@ -73,7 +73,7 @@ fn test_filter_list_by_age() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             // Bob and Carol are over 30
             assert_eq!(ret_val.as_deref(), Some("2"));
             assert!(console_output.contains("Filtered count:\t2"));
@@ -113,7 +113,7 @@ fn test_sort_list_and_pick_min() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("Mouse"));
             assert!(console_output.contains("Mouse"));
             assert!(console_output.contains("29"));
@@ -150,7 +150,7 @@ fn test_aggregate_sum_and_average() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("150"));
             assert!(console_output.contains("Total:\t150"));
             assert!(console_output.contains("Average:\t30"));
@@ -189,7 +189,7 @@ fn test_merge_two_lists() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("5"));
             assert!(console_output.contains("Total members:\t5"));
         }
@@ -237,7 +237,7 @@ fn test_sequential_per_item_tool_calls() {
     assert_eq!(enrich_call_count, 3);
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("3"));
             assert!(console_output.contains("Label(id_1)"));
             assert!(console_output.contains("Label(id_2)"));
@@ -272,7 +272,7 @@ fn test_find_max_in_list() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("99"));
             assert!(console_output.contains("Max reading:\t99"));
         }
@@ -316,7 +316,7 @@ fn test_nested_table_navigation() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("Lagos"));
             assert!(console_output.contains("Lagos"));
             assert!(console_output.contains("Ada Obi"));
@@ -361,7 +361,7 @@ fn test_group_and_count_by_category() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("3"));
             assert!(console_output.contains("Electronics:\t3"));
             assert!(console_output.contains("Clothing:\t2"));
@@ -460,7 +460,7 @@ fn test_deduplicate_merged_lists() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             // apple, banana, cherry, date, elderberry → 5 unique
             assert_eq!(ret_val.as_deref(), Some("5"));
             assert!(console_output.contains("Unique count:\t5"));

@@ -1,5 +1,6 @@
 use mlua::{Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, StdLib, Thread};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +34,15 @@ pub enum ExecutionResult {
     Finished {
         ret_val: Option<String>,
         console_output: String,
+        /// Tool intents built by stubs but never passed to `await_all()`.
+        ///
+        /// Non-empty when the LLM called a tool without wrapping it, e.g.:
+        ///   `get_weather({ location = "Lagos" })`              -- orphan
+        ///   `await_all(get_weather({ location = "Lagos" }))`   -- correct
+        ///
+        /// Feed these back to the LLM as a corrective message so it self-corrects
+        /// on the next turn without crashing the current execution.
+        orphaned_calls: Vec<ToolCall>,
     },
     /// The script paused and is waiting for these host tools to execute.
     YieldedForTools { tools: Vec<ToolCall> },
@@ -103,7 +113,6 @@ pub struct AuwgentSandbox {
     // ── Snapshot tracking ──────────────────────────────────────────────────────
     // These fields accumulate the session history automatically so that
     // snapshot() is free — callers do not need to track anything themselves.
-
     /// The script currently being executed (set by execute()).
     snapshot_script: Option<String>,
     /// All tool result rounds injected so far, in order.
@@ -114,6 +123,17 @@ pub struct AuwgentSandbox {
     snapshot_globals: serde_json::Value,
     /// A copy of all library chunks loaded via load_library().
     snapshot_libraries: Vec<String>,
+
+    // ── Orphan tracking ────────────────────────────────────────────────────────
+    // All mutable tracking state is kept in Rust (Arc<Mutex<...>>) because
+    // Luau's sandbox(true) recursively freezes tables reachable from the global
+    // env — so we cannot use Lua-side tables for mutable tracking after the
+    // first execute() call. The `__reg_intent` Rust closure registered before
+    // lock is called by stubs at runtime; function calls are always sandbox-safe.
+    /// Maps unique TID → ToolCall for every intent built by a tool stub.
+    /// Entries are removed when properly yielded via await_all. Remaining
+    /// entries at script completion are orphaned (never-yielded) calls.
+    intent_registry: Arc<Mutex<HashMap<u64, ToolCall>>>,
 }
 
 impl AuwgentSandbox {
@@ -125,11 +145,8 @@ impl AuwgentSandbox {
     /// `sandbox(true)` freezes the global table to read-only.
     pub fn new() -> LuaResult<Self> {
         // Only load safe standard libraries — io, os, package, debug are omitted.
-        let std_libs = StdLib::MATH
-            | StdLib::STRING
-            | StdLib::TABLE
-            | StdLib::UTF8
-            | StdLib::COROUTINE;
+        let std_libs =
+            StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::UTF8 | StdLib::COROUTINE;
 
         let lua = Lua::new_with(std_libs, mlua::LuaOptions::new().catch_rust_panics(true))?;
 
@@ -167,14 +184,61 @@ impl AuwgentSandbox {
         })?;
         lua.globals().set("print", print_func)?;
 
-        // 3. Inject `await_all` — the coroutine bridge that lets the LLM
-        //    write fully synchronous-looking tool calls while yielding to Rust.
+        // 3. `await_all` coroutine bridge.
+        //    A thin wrapper around coroutine.yield so the LLM can write
+        //    synchronous-looking tool calls. Orphan tracking is handled on
+        //    the Rust side via `__reg_intent`, not inside `await_all` itself.
         let wrapper_code = r#"
             function await_all(...)
                 return coroutine.yield(...)
             end
         "#;
         lua.load(wrapper_code).exec()?;
+
+        // 4. Orphan-tracking Rust infrastructure.
+        //
+        // Problem: Luau's sandbox(true) recursively freezes everything reachable
+        // from the global env, including any table we store there. We cannot
+        // mutate a Lua-side table from within a tool stub after sandbox lock.
+        //
+        // Solution: keep all mutable state in Rust (Arc<Mutex<...>>) and expose
+        // a single Rust closure `__reg_intent` as a Lua global. Calling a
+        // global function is always sandbox-safe — only global *writes* and table
+        // *mutations* are restricted. The closure writes into the Rust HashMap
+        // transparently.
+        //
+        // Protocol:
+        //   1. Each stub calls `__reg_intent(name, args)` → gets a unique TID.
+        //   2. The stub embeds `__tid = TID` in the intent table it returns.
+        //   3. resume_internal reads `__tid` from each yielded table and removes
+        //      the entry from intent_registry (the intent reached Rust safely).
+        //   4. Whatever remains in intent_registry at Finished is an orphan.
+        let intent_registry: Arc<Mutex<HashMap<u64, ToolCall>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let intent_counter: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+
+        let reg_registry = intent_registry.clone();
+        let reg_counter  = intent_counter.clone();
+        let reg_fn = lua.create_function(
+            move |lua_ctx, (name, payload_val): (String, mlua::Value)| {
+                let mut ctr = reg_counter.lock().unwrap();
+                *ctr += 1;
+                let tid = *ctr;
+
+                let payload: serde_json::Value = lua_ctx
+                    .from_value(payload_val)
+                    .unwrap_or(serde_json::json!({}));
+
+                reg_registry
+                    .lock()
+                    .unwrap()
+                    .insert(tid, ToolCall { tool_name: name, payload });
+
+                // Return the TID to Lua so the stub can embed it in the intent table.
+                Ok(tid as i64)
+            },
+        )?;
+        lua.globals().set("__reg_intent", reg_fn)?;
 
         // 4. Instruction-count interrupt (Infinite Loop Protection).
         //    Luau's VM calls this hook periodically. We count those pings.
@@ -205,6 +269,7 @@ impl AuwgentSandbox {
             snapshot_tools: Vec::new(),
             snapshot_globals: serde_json::Value::Object(serde_json::Map::new()),
             snapshot_libraries: Vec::new(),
+            intent_registry,
         })
     }
 
@@ -256,22 +321,29 @@ impl AuwgentSandbox {
         let mut script = String::new();
         for t in tools {
             if t.has_args {
+                // Stub calls the Rust closure `__reg_intent(name, args)` to register
+                // the intent in the engine's HashMap and get back a unique TID.
+                // The TID is embedded as `__tid` in the returned intent table.
+                // resume_internal removes the TID when it sees the intent via yield.
+                // Any TID remaining in the registry at Finished = orphan.
                 script.push_str(&format!(
                     r#"
                     function {}(args)
-                        return {{ name = "{}", payload = args }}
+                        local tid = __reg_intent("{}", args)
+                        return {{ name = "{}", payload = args, __tid = tid }}
                     end
                     "#,
-                    t.name, t.name
+                    t.name, t.name, t.name
                 ));
             } else {
                 script.push_str(&format!(
                     r#"
                     function {}()
-                        return {{ name = "{}" }}
+                        local tid = __reg_intent("{}", nil)
+                        return {{ name = "{}", __tid = tid }}
                     end
                     "#,
-                    t.name, t.name
+                    t.name, t.name, t.name
                 ));
             }
         }
@@ -340,6 +412,9 @@ impl AuwgentSandbox {
         self.snapshot_script = Some(source.to_string());
         self.snapshot_rounds.clear();
 
+        // Clear the orphan registry so a re-used engine starts each script fresh.
+        self.intent_registry.lock().unwrap().clear();
+
         // Reset the interrupt counter for this execution window.
         self.instr_count.store(0, Ordering::Relaxed);
 
@@ -385,10 +460,7 @@ impl AuwgentSandbox {
     /// The order of `results` must match the order of tools in the last `YieldedForTools`.
     /// Results are materialized to `serde_json::Value` and recorded for snapshot support,
     /// ensuring `ToolResult::Err` sentinel tables are faithfully reproduced on restore.
-    pub fn resume_with_results(
-        &mut self,
-        results: Vec<ToolResult>,
-    ) -> LuaResult<ExecutionResult> {
+    pub fn resume_with_results(&mut self, results: Vec<ToolResult>) -> LuaResult<ExecutionResult> {
         // Materialize each ToolResult to a plain JSON value for storage and injection.
         // ToolResult::Err becomes { "__error": true, "message": "..." } which,
         // when re-injected via resume_with_json on restore, produces the same Lua table.
@@ -473,6 +545,15 @@ impl AuwgentSandbox {
 
     // ─── Internal ─────────────────────────────────────────────────────────────
 
+    /// Read any tool intents that were built by stubs but never passed to `await_all()`.
+    ///
+    /// Returns whatever remains in `intent_registry` — entries are removed as
+    /// intents are properly yielded through the Resumable branch of resume_internal.
+    /// Whatever is left when the script finishes was built but silently discarded.
+    fn collect_orphans(&self) -> Vec<ToolCall> {
+        self.intent_registry.lock().unwrap().values().cloned().collect()
+    }
+
     fn resume_internal(&mut self, args: MultiValue) -> LuaResult<ExecutionResult> {
         let thread_key = match &self.active_thread {
             Some(key) => key,
@@ -492,8 +573,15 @@ impl AuwgentSandbox {
                 for val in result.into_iter() {
                     if let mlua::Value::Table(t) = val {
                         let tool_name: Option<String> = t.get("name").ok();
-                        let payload_val: mlua::Value =
-                            t.get("payload").unwrap_or(mlua::Value::Nil);
+                        let payload_val: mlua::Value = t.get("payload").unwrap_or(mlua::Value::Nil);
+
+                        // This intent reached Rust via await_all — deregister it so it
+                        // is never reported as an orphan. The TID was embedded in the
+                        // intent table by the stub when it called __reg_intent.
+                        let tid: Option<i64> = t.get("__tid").ok();
+                        if let Some(id) = tid {
+                            self.intent_registry.lock().unwrap().remove(&(id as u64));
+                        }
 
                         if let Some(name) = tool_name {
                             // Deserialize the Lua table payload into a serde_json::Value.
@@ -526,9 +614,14 @@ impl AuwgentSandbox {
                     Some(ret_strings.join(", "))
                 };
 
+                // Collect tool calls the LLM built without wrapping in await_all().
+                // collect_orphans() is pure Rust — reads directly from intent_registry.
+                let orphaned_calls = self.collect_orphans();
+
                 Ok(ExecutionResult::Finished {
                     ret_val,
                     console_output: self.get_console_output(),
+                    orphaned_calls,
                 })
             }
         }

@@ -49,7 +49,7 @@ fn test_basic_execution_no_tools() {
     "#;
 
     match engine.execute(script).unwrap() {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("done"));
             assert!(console_output.contains("Hello from the sandbox!"));
         }
@@ -118,7 +118,7 @@ fn test_advanced_sandbox_loop() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("SUCCESS"));
             assert!(console_output.contains("Got user data!\tJohnDoe"));
             assert!(console_output.contains("Final result:\ttrue"));
@@ -187,7 +187,7 @@ fn test_inject_globals() {
     "#;
 
     match engine.execute(script).unwrap() {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("agent_007"));
             assert!(console_output.contains("agent_007"));
             assert!(console_output.contains("/app/project"));
@@ -387,7 +387,7 @@ fn test_partial_tool_failure_via_tool_result() {
             ];
 
             match engine.resume_with_results(results).unwrap() {
-                ExecutionResult::Finished { ret_val, console_output } => {
+                ExecutionResult::Finished { ret_val, console_output, .. } => {
                     assert_eq!(ret_val.as_deref(), Some("handled"));
                     // Error was handled gracefully — not a crash
                     assert!(console_output.contains("Stocks failed:"));
@@ -433,7 +433,7 @@ fn test_all_tools_fail_gracefully() {
             ];
 
             match engine.resume_with_results(results).unwrap() {
-                ExecutionResult::Finished { ret_val, console_output } => {
+                ExecutionResult::Finished { ret_val, console_output, .. } => {
                     assert_eq!(ret_val.as_deref(), Some("2"));
                     assert!(console_output.contains("Total errors:\t2"));
                 }
@@ -498,7 +498,7 @@ fn test_snapshot_restore_fast_forwards_to_next_yield() {
                 .resume_with_json(vec![serde_json::json!({ "val": "beta" })])
                 .unwrap()
             {
-                ExecutionResult::Finished { ret_val, console_output } => {
+                ExecutionResult::Finished { ret_val, console_output, .. } => {
                     assert_eq!(ret_val.as_deref(), Some("done"));
                     // a.val was cached from round 0, b.val from the real resume
                     assert!(console_output.contains("A:\talpha"));
@@ -598,7 +598,7 @@ fn test_snapshot_preserves_error_sentinel_across_restore() {
                 .resume_with_json(vec![serde_json::json!({ "status": "ok" })])
                 .unwrap()
             {
-                ExecutionResult::Finished { ret_val, console_output } => {
+                ExecutionResult::Finished { ret_val, console_output, .. } => {
                     assert_eq!(ret_val.as_deref(), Some("ok"));
                     // Proves __error table was faithfully reproduced after restore
                     assert!(console_output.contains("Error captured:\ttimeout after 30s"));
@@ -640,7 +640,7 @@ fn test_load_library_functions_available_in_script() {
     "#;
 
     match engine.execute(script).unwrap() {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             assert_eq!(ret_val.as_deref(), Some("$19.90"));
             assert!(console_output.contains("Price:\t$19.90"));
             assert!(console_output.contains("Clamped:\t100"));
@@ -765,7 +765,7 @@ fn test_await_all_works_inside_nested_functions() {
     assert_eq!(call_count, 3);
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             let report = ret_val.unwrap_or_default();
             // Verify each item was enriched correctly — locals at all stack frames survived
             assert!(report.contains("[item_a:1]"), "got: {}", report);
@@ -815,11 +815,254 @@ fn test_await_all_works_inside_closure() {
     });
 
     match result {
-        ExecutionResult::Finished { ret_val, console_output } => {
+        ExecutionResult::Finished { ret_val, console_output, .. } => {
             // 5 * 10 = 50, then transform adds 1 → 51
             // Luau treats 50 + 1.0 as integer when inputs are whole numbers
             assert_eq!(ret_val.as_deref(), Some("51"));
             assert!(console_output.contains("Output:\t51"));
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
+
+// ─── Orphan Detection Tests ─────────────────────────────────────────────────────────────────
+
+/// A tool stub called without `await_all()` is silently discarded at runtime.
+/// The engine detects this and surfaces it in `orphaned_calls` so the host can
+/// feed a corrective message back to the LLM without crashing the execution.
+#[test]
+fn test_orphaned_tool_call_detected() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[
+            make_tool("get_weather", "Get weather", true, Some("{ location: string }")),
+            make_tool("get_time", "Get current time", false, None),
+        ])
+        .unwrap();
+
+    // Bug: the LLM forgets await_all on get_weather.
+    // get_time is called correctly and should dispatch normally.
+    let script = r#"
+        get_weather({ location = "Lagos" })  -- orphan: built but never yielded
+        local t = await_all(get_time())      -- correct
+        print("Time:", t.utc)
+        return "done"
+    "#;
+
+    let result = run_to_finish(&mut engine, script, |name, _| match name {
+        "get_time" => serde_json::json!({ "utc": "12:00Z" }),
+        other => panic!("Unexpected tool dispatched: {}", other),
+    });
+
+    match result {
+        ExecutionResult::Finished { orphaned_calls, console_output, .. } => {
+            // Exactly one orphan: get_weather was built but never passed to await_all
+            assert_eq!(orphaned_calls.len(), 1, "Expected 1 orphan, got: {:?}", orphaned_calls);
+            assert_eq!(orphaned_calls[0].tool_name, "get_weather");
+            assert_eq!(orphaned_calls[0].payload["location"], "Lagos");
+            // The correctly-awaited tool still delivered its result
+            assert!(console_output.contains("Time:\t12:00Z"));
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
+
+/// Correctly awaited tools produce zero orphans.
+#[test]
+fn test_no_orphans_when_all_tools_awaited() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[make_tool("get_data", "Get data", false, None)])
+        .unwrap();
+
+    let result = run_to_finish(
+        &mut engine,
+        "local d = await_all(get_data()) return d.ok",
+        |_, _| serde_json::json!({ "ok": "yes" }),
+    );
+
+    match result {
+        ExecutionResult::Finished { orphaned_calls, .. } => {
+            assert!(
+                orphaned_calls.is_empty(),
+                "Expected no orphans, got: {:?}",
+                orphaned_calls
+            );
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
+
+/// Parallel batch via await_all: multiple tools in one call — none orphaned.
+#[test]
+fn test_no_orphans_with_parallel_batch() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[
+            make_tool("tool_a", "Tool A", false, None),
+            make_tool("tool_b", "Tool B", false, None),
+        ])
+        .unwrap();
+
+    let result = run_to_finish(
+        &mut engine,
+        "local a, b = await_all(tool_a(), tool_b()) return a.v .. b.v",
+        |name, _| match name {
+            "tool_a" => serde_json::json!({ "v": "X" }),
+            "tool_b" => serde_json::json!({ "v": "Y" }),
+            other => panic!("Unexpected: {}", other),
+        },
+    );
+
+    match result {
+        ExecutionResult::Finished { orphaned_calls, .. } => {
+            assert!(
+                orphaned_calls.is_empty(),
+                "Expected no orphans in parallel batch, got: {:?}",
+                orphaned_calls
+            );
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
+
+/// Full corrective-feedback round-trip.
+///
+/// Simulates the host-side workflow:
+///   1. LLM produces a buggy script (forgot await_all on one tool).
+///   2. Engine returns Finished with non-empty `orphaned_calls`.
+///   3. Host reads orphaned_calls, builds a corrective hint string.
+///   4. Host (re-)prompts the LLM → LLM produces a corrected script.
+///   5. Corrected script runs to Finished with zero orphans and correct results.
+///
+/// This test does not actually call an LLM; it simulates steps 3–5 directly
+/// so the round-trip contract is verifiable in a unit test context.
+#[test]
+fn test_orphan_corrective_feedback_round_trip() {
+    // ── Round 1: buggy script ────────────────────────────────────────────────
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[make_tool(
+            "get_weather",
+            "Get weather for a city",
+            true,
+            Some("{ location: string }"),
+        )])
+        .unwrap();
+
+    let buggy_script = r#"
+        -- LLM bug: built the intent but forgot await_all
+        get_weather({ location = "Lagos" })
+        return "no_weather"
+    "#;
+
+    let round1 = engine.execute(buggy_script).unwrap();
+
+    // Step 2: host observes orphaned calls
+    let corrective_hint = match round1 {
+        ExecutionResult::Finished { orphaned_calls, ret_val, .. } => {
+            assert_eq!(orphaned_calls.len(), 1, "Expected 1 orphan");
+            assert_eq!(orphaned_calls[0].tool_name, "get_weather");
+            assert_eq!(orphaned_calls[0].payload["location"], "Lagos");
+            // Script still "finished" — returned its fallback value
+            assert_eq!(ret_val.as_deref(), Some("no_weather"));
+
+            // Step 3: host builds corrective hint from the orphaned call data
+            format!(
+                "You called `{}` without wrapping it in `await_all(...)`. \
+                 Always write: `await_all({}(...))` to actually execute a tool.",
+                orphaned_calls[0].tool_name, orphaned_calls[0].tool_name
+            )
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    };
+
+    // The hint must mention the offending tool so the LLM can self-correct
+    assert!(corrective_hint.contains("get_weather"));
+    assert!(corrective_hint.contains("await_all"));
+
+    // ── Round 2: corrected script (LLM applied the feedback) ────────────────
+    let mut engine2 = AuwgentSandbox::new().unwrap();
+    engine2
+        .register_tools(&[make_tool(
+            "get_weather",
+            "Get weather for a city",
+            true,
+            Some("{ location: string }"),
+        )])
+        .unwrap();
+
+    let corrected_script = r#"
+        local w = await_all(get_weather({ location = "Lagos" }))
+        return w.temp
+    "#;
+
+    let round2 = run_to_finish(&mut engine2, corrected_script, |_, _| {
+        serde_json::json!({ "temp": "32C", "city": "Lagos" })
+    });
+
+    match round2 {
+        ExecutionResult::Finished { orphaned_calls, ret_val, .. } => {
+            // No orphans — LLM used await_all correctly this time
+            assert!(
+                orphaned_calls.is_empty(),
+                "Expected no orphans in corrected script, got: {:?}",
+                orphaned_calls
+            );
+            // Tool result was actually delivered
+            assert_eq!(ret_val.as_deref(), Some("32C"));
+        }
+        other => panic!("Expected Finished on round 2, got {:?}", other),
+    }
+}
+
+/// Multiple tools orphaned in a single script — all surfaced, none dispatched.
+/// This covers the case where the LLM builds multiple intents but calls none
+/// of them through await_all, e.g. it forgot the entire await_all block.
+#[test]
+fn test_multiple_orphans_all_detected() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[
+            make_tool("tool_x", "Tool X", true, Some("{ x: number }")),
+            make_tool("tool_y", "Tool Y", true, Some("{ y: string }")),
+            make_tool("tool_z", "Tool Z", false, None),
+        ])
+        .unwrap();
+
+    // All three tools built — none passed to await_all
+    let script = r#"
+        tool_x({ x = 42 })
+        tool_y({ y = "hello" })
+        tool_z()
+        return "forgot_everything"
+    "#;
+
+    let result = engine.execute(script).unwrap();
+
+    match result {
+        ExecutionResult::Finished { orphaned_calls, ret_val, .. } => {
+            // All three intents are orphans
+            assert_eq!(
+                orphaned_calls.len(),
+                3,
+                "Expected 3 orphans, got: {:?}",
+                orphaned_calls
+            );
+            // Collect names for assertion (HashMap order is non-deterministic)
+            let mut names: Vec<&str> =
+                orphaned_calls.iter().map(|c| c.tool_name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["tool_x", "tool_y", "tool_z"]);
+
+            // Verify payloads where present
+            let x = orphaned_calls.iter().find(|c| c.tool_name == "tool_x").unwrap();
+            assert_eq!(x.payload["x"], 42);
+            let y = orphaned_calls.iter().find(|c| c.tool_name == "tool_y").unwrap();
+            assert_eq!(y.payload["y"], "hello");
+
+            // Script ran to completion with its fallback return
+            assert_eq!(ret_val.as_deref(), Some("forgot_everything"));
         }
         other => panic!("Expected Finished, got {:?}", other),
     }

@@ -182,9 +182,23 @@ fn main() {
                     .collect();
                 status = engine.resume_with_json(responses).unwrap();
             }
-            ExecutionResult::Finished { ret_val, console_output } => {
+            ExecutionResult::Finished { ret_val, console_output, orphaned_calls } => {
+                // Feed the execution trace back to the LLM as context
                 println!("Output:\n{}", console_output);
-                println!("Returned: {:?}", ret_val);
+
+                // Use the structured return value in your application logic
+                if let Some(val) = ret_val {
+                    println!("Agent returned: {}", val);
+                }
+
+                // Detect tools the LLM called without await_all
+                if !orphaned_calls.is_empty() {
+                    println!("Warning: {} tool(s) were called but never executed:", orphaned_calls.len());
+                    for c in &orphaned_calls {
+                        println!("  - {} (payload: {})", c.tool_name, c.payload);
+                    }
+                    // Correct the LLM on the next turn (see Orphan Detection section)
+                }
                 break;
             }
             ExecutionResult::Error(e) => panic!("{}", e),
@@ -219,7 +233,7 @@ engine.execute(script)
               │
          engine.resume_with_json(...)
               │
-         Finished { console_output, ret_val }  ← done
+          Finished { console_output, ret_val, orphaned_calls }  ← done
 ```
 
 The LLM is **not involved** during any of these steps. It wrote the script once and went to sleep.
@@ -259,14 +273,58 @@ local result = await_all(search("rust sandbox", 10))
 
 ### Console Output
 
-Everything `print()`'d by the LLM is captured in a Rust buffer. This is your **feedback loop** — pass `console_output` back to the LLM context so the model can see what its script did.
+Everything `print()`'d by the LLM is captured in a Rust buffer and available in `ExecutionResult::Finished` as `console_output`. This is the **LLM's context channel** — it shows what the model's script did, step by step.
 
 ```rust
 ExecutionResult::Finished { console_output, .. } => {
-    // Feed this back into the LLM message history
+    // Append to conversation history so the model can see what happened
     llm.add_message("tool", &console_output);
 }
 ```
+
+Typical script output:
+```
+Fetching weather for Lagos...
+Condition: Sunny, Temp: 32C
+Analysis complete.
+```
+
+---
+
+### Return Value (`ret_val`)
+
+The `ret_val` field in `ExecutionResult::Finished` is the value the LLM script explicitly `return`s — the **host's action channel**. Unlike `console_output` (which is verbose and human-readable), `ret_val` is a compact, machine-readable signal your application code acts on directly.
+
+```rust
+ExecutionResult::Finished { ret_val, .. } => {
+    match ret_val.as_deref() {
+        Some("APPROVED")  => approve_request(session_id),
+        Some("REJECTED")  => reject_request(session_id),
+        Some("ESCALATE")  => notify_human(session_id),
+        Some(val)         => store_result(session_id, val),
+        None              => { /* script ran but returned nothing — fine */ }
+    }
+}
+```
+
+**When to use it:**
+
+| Use case | What the script returns | What the host does |
+|---|---|---|
+| Routing / state machine | `"APPROVED"` / `"REJECTED"` | Triggers next workflow step |
+| Data extraction | A customer ID, an amount, a status | Stores in database |
+| Final answer to user | The computed result string | Displays in UI |
+| Validation | `"valid"` / `"invalid:reason"` | Gates the next operation |
+| Compound result | `"id\|total\|status"` | Splits and stores fields |
+
+**Key distinction:**
+
+```
+console_output  →  the MODEL reads it on the next turn  (execution trace)
+ret_val         →  your HOST APPLICATION reads it       (structured result)
+```
+
+Scripts do not have to return anything. If no `return` is executed, `ret_val` is `None` — this is normal for "do this task and print results" style agents.
 
 ---
 
@@ -386,9 +444,11 @@ let result = engine.execute(llm_generated_script)?;
 ```
 
 Returns one of:
-- `ExecutionResult::Finished { ret_val, console_output }` — script completed
-- `ExecutionResult::YieldedForTools { tools }` — script is paused, needs tool results
+- `ExecutionResult::Finished { ret_val, console_output, orphaned_calls }` — script ran to completion
+- `ExecutionResult::YieldedForTools { tools }` — script is paused waiting for tool results
 - `ExecutionResult::Error(String)` — non-recoverable Lua runtime error
+
+See the [Orphan Detection](#orphaned-tool-detection) section for how to handle `orphaned_calls`.
 
 ---
 
@@ -470,6 +530,71 @@ Returns everything `print()`'d so far in the current execution. Normally you rea
 
 ---
 
+## Orphaned Tool Detection
+
+Some LLM models occasionally write a tool call **without** wrapping it in `await_all()`. Instead of silently discarding the call (and returning nothing to the script), the engine tracks it and surfaces the intent in `ExecutionResult::Finished` so the host can correct the model.
+
+```lua
+-- LLM bug: calls get_weather but forgets await_all
+get_weather({ location = "Lagos" })   -- intent built, but never executed
+return "done"
+```
+
+The script finishes without error — but no tool ran. Without detection, the host would never know the LLM intended to call a tool.
+
+**With orphan detection**, the host gets:
+
+```rust
+ExecutionResult::Finished {
+    ret_val: Some("done"),
+    console_output: "",
+    orphaned_calls: [
+        ToolCall {
+            tool_name: "get_weather",
+            payload: { "location": "Lagos" },
+        }
+    ]
+}
+```
+
+### Corrective feedback pattern
+
+Use `orphaned_calls` to build a targeted corrective message for the next LLM turn:
+
+```rust
+ExecutionResult::Finished { orphaned_calls, console_output, ret_val } => {
+    // Feed the execution trace back to the LLM
+    llm.add_message("assistant", &console_output);
+
+    if !orphaned_calls.is_empty() {
+        // Build a precise correction instead of a generic retry
+        let correction = orphaned_calls.iter().map(|c| {
+            format!(
+                "You called `{}` without `await_all()`. \
+                 Wrap it like this: `await_all({}(...))` to actually execute it.",
+                c.tool_name, c.tool_name
+            )
+        }).collect::<Vec<_>>().join("\n");
+
+        llm.add_message("system", &correction);
+        // LLM will self-correct on the next turn
+    }
+}
+```
+
+### Why this beats a generic retry
+
+| Without orphan detection | With orphan detection |
+|---|---|
+| Script finishes silently | Host knows exactly which tool(s) were intended |
+| Host sends a vague "try again" | Host sends: *"You called `get_weather` without `await_all`"* |
+| LLM may repeat the same mistake | LLM gets tool name + payload — can fix with precision |
+| Payload is lost | Payload is preserved — corrective message can include it |
+
+> **How it works internally:** Each tool stub registers its intent in a Rust-owned `HashMap` (bypassing the Lua sandbox restriction on table mutation). When `await_all()` yields an intent to Rust, that entry is removed. Whatever remains in the map when the script finishes was never yielded — those are the orphaned calls.
+
+---
+
 ## Session Persistence & Snapshots
 
 One of the hardest problems in agentic backends is keeping an LLM's execution session alive across stateless HTTP requests. Auwgent Mode solves this with `SandboxSnapshot` — a serializable record of everything needed to rebuild the engine and fast-forward it to exactly where it left off.
@@ -532,7 +657,10 @@ match status {
         let responses = dispatch_tools(&tools).await;
         engine.resume_with_json(responses)?;
     }
-    ExecutionResult::Finished { .. } => { /* already done */ }
+    ExecutionResult::Finished { orphaned_calls, .. } => {
+        // already done — check for orphans if needed
+        if !orphaned_calls.is_empty() { /* handle */ }
+    }
     ExecutionResult::Error(e) => { panic!("{}", e); }
 }
 ```
