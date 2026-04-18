@@ -702,3 +702,125 @@ fn test_load_library_survives_snapshot_restore() {
         other => panic!("{:?}", other),
     }
 }
+
+// ─── Coroutine Depth Tests ────────────────────────────────────────────────────
+
+/// Proves that await_all works correctly when called from inside nested Lua
+/// function calls. The coroutine suspends the ENTIRE thread stack — local
+/// variables at every frame survive the yield/resume cycle transparently.
+#[test]
+fn test_await_all_works_inside_nested_functions() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[make_tool("get_item", "Get item by id", true, None)])
+        .unwrap();
+
+    // Three levels of function nesting, with await_all at the deepest level.
+    // This is the same pattern a coding agent would use: helper functions
+    // that transparently delegate to tools without the caller knowing.
+    engine
+        .load_library(
+            r#"
+        -- Level 3 (deepest): calls await_all directly
+        local function fetch_detail(id)
+            local data = await_all(get_item({ id = id }))
+            -- These locals must survive the yield/resume cycle
+            return data.label .. ":" .. tostring(data.score)
+        end
+
+        -- Level 2: calls into level 3
+        local function process_item(id)
+            local detail = fetch_detail(id)   -- transparent — no yield syntax needed here
+            return "[" .. detail .. "]"
+        end
+
+        -- Level 1: loops and calls level 2 per item
+        function build_report(ids)
+            local parts = {}
+            for _, id in ipairs(ids) do
+                table.insert(parts, process_item(id))
+            end
+            return table.concat(parts, ", ")
+        end
+    "#,
+        )
+        .unwrap();
+
+    let script = r#"
+        local report = build_report({ "a", "b", "c" })
+        print("Report:", report)
+        return report
+    "#;
+
+    let mut call_count = 0usize;
+    let result = run_to_finish(&mut engine, script, |name, payload| {
+        assert_eq!(name, "get_item");
+        call_count += 1;
+        let id = payload["id"].as_str().unwrap_or("");
+        // Each call returns a unique score so we can verify all three survived correctly
+        serde_json::json!({ "label": format!("item_{}", id), "score": call_count })
+    });
+
+    // await_all was called 3 times — once per item, from 3 levels deep
+    assert_eq!(call_count, 3);
+
+    match result {
+        ExecutionResult::Finished { ret_val, console_output } => {
+            let report = ret_val.unwrap_or_default();
+            // Verify each item was enriched correctly — locals at all stack frames survived
+            assert!(report.contains("[item_a:1]"), "got: {}", report);
+            assert!(report.contains("[item_b:2]"), "got: {}", report);
+            assert!(report.contains("[item_c:3]"), "got: {}", report);
+            assert!(console_output.contains("Report:"));
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
+
+/// Proves that a yielded tool called inside a deeply nested closure (not just
+/// a named function) also suspends and resumes correctly.
+#[test]
+fn test_await_all_works_inside_closure() {
+    let mut engine = AuwgentSandbox::new().unwrap();
+    engine
+        .register_tools(&[make_tool("transform", "Transform value", true, None)])
+        .unwrap();
+
+    // The closure is created and stored inside a table — a more complex capture scenario
+    engine
+        .load_library(
+            r#"
+        function make_pipeline(multiplier)
+            -- Returns a closure that captures `multiplier` as an upvalue
+            return function(val)
+                local result = await_all(transform({ value = val * multiplier }))
+                return result.transformed
+            end
+        end
+    "#,
+        )
+        .unwrap();
+
+    let script = r#"
+        local pipeline = make_pipeline(10)
+        local out = pipeline(5)   -- 5 * 10 = 50 sent to transform
+        print("Output:", out)
+        return tostring(out)
+    "#;
+
+    let result = run_to_finish(&mut engine, script, |_, payload| {
+        let v = payload["value"].as_f64().unwrap_or(0.0);
+        // The value sent should be 50 (5 * 10), proving the closure upvalue survived yield
+        serde_json::json!({ "transformed": v + 1.0 })
+    });
+
+    match result {
+        ExecutionResult::Finished { ret_val, console_output } => {
+            // 5 * 10 = 50, then transform adds 1 → 51
+            // Luau treats 50 + 1.0 as integer when inputs are whole numbers
+            assert_eq!(ret_val.as_deref(), Some("51"));
+            assert!(console_output.contains("Output:\t51"));
+        }
+        other => panic!("Expected Finished, got {:?}", other),
+    }
+}
