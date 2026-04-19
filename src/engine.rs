@@ -101,6 +101,84 @@ pub struct SandboxSnapshot {
 
 // ─── Sandbox ─────────────────────────────────────────────────────────────────
 
+/// Recursively converts any Lua value to a human-readable string.
+///
+/// This is the backing implementation for the sandboxed `print` function.
+/// Unlike `lua.coerce_string()` — which emits `table: 0x7f...` for tables —
+/// this function walks the table and renders it as `{ key: value, ... }`.
+///
+/// Rules:
+/// - Arrays (consecutive integer keys starting at 1) are rendered first, positionally.
+/// - Hash keys are rendered as `key: value` pairs.
+/// - Recursion is capped at depth 5 (`{...}` is emitted beyond that).
+/// - nil → `"nil"`, booleans → `"true"`/`"false"`, numbers match Lua's `%g` format.
+/// - Functions, userdata, and threads fall back to their Lua type name.
+fn lua_val_to_string(lua: &Lua, val: mlua::Value, depth: u8) -> String {
+    const MAX_DEPTH: u8 = 5;
+
+    match val {
+        mlua::Value::Nil            => "nil".to_string(),
+        mlua::Value::Boolean(b)     => if b { "true" } else { "false" }.to_string(),
+        mlua::Value::Integer(i)     => i.to_string(),
+        mlua::Value::Number(n) => {
+            // Replicate Lua's %g formatting: drop the decimal point for whole numbers.
+            if n.fract() == 0.0 && n.abs() < 1e15 && n.is_finite() {
+                format!("{}", n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        mlua::Value::String(s)      => s.to_string_lossy().to_string(),
+        mlua::Value::Table(t) => {
+            if depth >= MAX_DEPTH {
+                return "{...}".to_string();
+            }
+
+            let mut parts: Vec<String> = Vec::new();
+
+            // ── Array section ────────────────────────────────────────────────
+            // Walk consecutive integer keys from 1 upward before hash keys so
+            // positional results (e.g. tool return values) render naturally.
+            let mut arr_len: i64 = 0;
+            loop {
+                match t.raw_get::<mlua::Value>(arr_len + 1) {
+                    Ok(v) if !matches!(v, mlua::Value::Nil) => {
+                        parts.push(lua_val_to_string(lua, v, depth + 1));
+                        arr_len += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            // ── Hash section ─────────────────────────────────────────────────
+            // Emit all non-array key-value pairs as `key: value`.
+            for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    // Skip integer indices already emitted above.
+                    if let mlua::Value::Integer(i) = &k {
+                        if *i >= 1 && *i <= arr_len {
+                            continue;
+                        }
+                    }
+                    let key = match &k {
+                        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+                        other => format!("[{}]", lua_val_to_string(lua, other.clone(), depth + 1)),
+                    };
+                    parts.push(format!("{key}: {}", lua_val_to_string(lua, v, depth + 1)));
+                }
+            }
+
+            if parts.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{ {} }}", parts.join(", "))
+            }
+        }
+        // Functions, threads, userdata — no meaningful string representation.
+        other => other.type_name().to_string(),
+    }
+}
+
 pub struct AuwgentSandbox {
     lua: Lua,
     active_thread: Option<RegistryKey>,
@@ -162,20 +240,14 @@ impl AuwgentSandbox {
             let arc = lua.app_data_ref::<Arc<Mutex<String>>>().unwrap();
             let mut buf = arc.lock().unwrap();
 
+            // Build one tab-separated line, exactly as native Lua print does,
+            // but with tables serialized to readable text instead of addresses.
             let mut line = String::new();
             for (i, val) in args.into_iter().enumerate() {
                 if i > 0 {
                     line.push('\t');
                 }
-                // Lua's native tostring() rules: booleans need special handling
-                // because coerce_string does not convert them natively.
-                if let mlua::Value::Boolean(b) = val {
-                    line.push_str(if b { "true" } else { "false" });
-                } else if let Ok(Some(s)) = lua.coerce_string(val.clone()) {
-                    line.push_str(&s.to_string_lossy());
-                } else {
-                    line.push_str(val.type_name());
-                }
+                line.push_str(&lua_val_to_string(lua, val, 0));
             }
             buf.push_str(&line);
             buf.push('\n');
