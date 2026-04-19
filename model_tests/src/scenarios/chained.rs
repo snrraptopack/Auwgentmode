@@ -74,13 +74,22 @@ impl Scenario for ChainedScenario {
         }
 
         // 2+ rounds is the definitive structural proof that the model chained
-        // the calls correctly — it used round-1 data to drive round-2.
-        // We do NOT check console_output content: printing a Lua table outputs
-        // `table: 0x...` (a pointer), not its string fields, so string matching
-        // is inherently unreliable here.
-        ScenarioOutcome::Pass(format!(
-            "{} sequential rounds — model correctly chained fetch_user → generate_report",
-            run.tool_rounds
-        ))
+        // the calls correctly. We also verify the output contains the injected
+        // mock data to ensure the table serialization works.
+        let combined = run.console_output.to_lowercase()
+            + run.ret_val.as_deref().unwrap_or("").to_lowercase().as_str();
+
+        if combined.contains("amara") || combined.contains("report") || combined.contains("pro") {
+            ScenarioOutcome::Pass(format!(
+                "{} sequential rounds — output correctly references user/report data",
+                run.tool_rounds
+            ))
+        } else {
+            ScenarioOutcome::Warn(format!(
+                "{} rounds ran but output doesn't mention expected user data. Output: {}",
+                run.tool_rounds,
+                combined.chars().take(80).collect::<String>().replace('\n', " ")
+            ))
+        }
     }
 }
