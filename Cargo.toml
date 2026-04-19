@@ -1,17 +1,27 @@
+[workspace]
+members  = [".", "model_tests"]
+resolver = "2"
+
 [package]
-name = "auwgent_mode"
+name    = "auwgent_mode"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mlua = { version = "0.11.6", features = ["luau", "vendored", "serialize"] }
-thiserror = "2.0.18"
-serde = { version = "1.0.228", features = ["derive"] }
+mlua       = { version = "0.11.6", features = ["luau", "vendored", "serialize"] }
+thiserror  = "2.0.18"
+serde      = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
+# Strip debug symbols from all dependencies in dev builds.
+# Prevents MSVC linker LNK1318 (PDB size limit) when linking heavy
+# dep trees like reqwest + tokio + hyper + mlua together.
+[profile.dev.package."*"]
+debug = false
+
 [[bench]]
-name = "startup"
+name    = "startup"
 harness = false

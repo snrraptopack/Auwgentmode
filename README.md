@@ -86,13 +86,13 @@ When the LLM calls `await_all(search_web(...))`, the sandbox immediately **freez
 
 | Capability | VM-bound tools | Auwgent Mode |
 |---|---|---|
-| Parallel tool execution | ❌ Sequential by default | ✅ `tokio::join!` on every yield batch |
-| Auth / permission checks | Baked into each tool fn | ✅ Centralized in the host loop |
-| Rate limiting | Per-function implementation | ✅ One place in the host dispatch |
-| Caching | Per-function implementation | ✅ Intercept any tool by name |
-| Audit logging | Per-function implementation | ✅ Log every `ToolCall` struct |
-| Cancellation | Cannot cancel a running Rust fn | ✅ Drop the resume call |
-| Tool mocking for tests | Requires VM setup | ✅ Just return different JSON |
+| Parallel tool execution |  Sequential by default |  `tokio::join!` on every yield batch |
+| Auth / permission checks | Baked into each tool fn |  Centralized in the host loop |
+| Rate limiting | Per-function implementation |  One place in the host dispatch |
+| Caching | Per-function implementation |  Intercept any tool by name |
+| Audit logging | Per-function implementation |  Log every `ToolCall` struct |
+| Cancellation | Cannot cancel a running Rust fn |  Drop the resume call |
+| Tool mocking for tests | Requires VM setup |  Just return different JSON |
 
 ### What the host receives
 
@@ -264,10 +264,10 @@ print(report.summary)
 All tools accept a **single table** of named arguments. This prevents positional-argument hallucinations and maps cleanly to JSON.
 
 ```lua
--- ✅ Correct: named parameters in a table
+--  Correct: named parameters in a table
 local result = await_all(search({ query = "rust sandbox", limit = 10 }))
 
--- ❌ Avoid: positional args are fragile for LLMs
+--  Avoid: positional args are fragile for LLMs
 local result = await_all(search("rust sandbox", 10))
 ```
 
