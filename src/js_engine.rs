@@ -1,5 +1,6 @@
 use rquickjs::{Context, Function, Object, Runtime, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::types::{
@@ -55,6 +56,7 @@ pub struct QuickJsSandbox {
     // before the `Context` (which contains the JS heap) is destroyed.
     // `Context` must be destroyed before `Runtime`.
     state: Arc<Mutex<SharedState>>,
+    interrupt_count: Arc<AtomicU64>,
     context: Context,
     runtime: Runtime,
 
@@ -97,13 +99,11 @@ impl QuickJsSandbox {
         runtime.set_memory_limit(20 * 1024 * 1024);
 
         // Infinite-loop protection (~100 k interrupt ticks, same budget as Luau).
-        let interrupt_count = Arc::new(Mutex::new(0u64));
+        let interrupt_count = Arc::new(AtomicU64::new(0));
         runtime.set_interrupt_handler(Some({
             let count = interrupt_count.clone();
             Box::new(move || {
-                let mut c = count.lock().unwrap();
-                *c += 1;
-                *c > 100_000
+                count.fetch_add(1, Ordering::Relaxed) > 100_000
             })
         }));
 
@@ -143,6 +143,7 @@ impl QuickJsSandbox {
             runtime,
             context,
             state,
+            interrupt_count,
             snapshot_script: None,
             snapshot_rounds: Vec::new(),
             snapshot_tools: Vec::new(),
@@ -287,6 +288,7 @@ impl QuickJsSandbox {
         self.snapshot_script = Some(source.to_string());
         self.snapshot_rounds.clear();
         self.state.lock().unwrap().clear_for_execute();
+        self.reset_interrupt_counter();
 
         // Reset the queue so stale entries from a previous run don't bleed in.
         self.context.with(|ctx| -> rquickjs::Result<()> {
@@ -306,6 +308,7 @@ impl QuickJsSandbox {
     /// Resume by resolving all pending Promises with JSON values.
     pub fn resume_with_json(&mut self, next_values: Vec<serde_json::Value>) -> JsResult<ExecutionResult> {
         self.snapshot_rounds.push(next_values.clone());
+        self.reset_interrupt_counter();
 
         // Sort IDs ascending so they match the order tools were yielded.
         let ids: Vec<u64> = {
@@ -456,6 +459,25 @@ impl QuickJsSandbox {
             })
         }
     }
+
+    fn reset_interrupt_counter(&self) {
+        self.interrupt_count.store(0, Ordering::Relaxed);
+    }
+
+    fn clear_js_roots(&mut self) {
+        if let Ok(mut st) = self.state.lock() {
+            st.pending.clear();
+            st.staged.clear();
+        }
+
+        let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
+            ctx.eval::<(), _>(b"__auwgent_queue = [];")?;
+            Ok(())
+        });
+
+        while matches!(self.runtime.execute_pending_job(), Ok(true)) {}
+        self.runtime.run_gc();
+    }
 }
 
 impl Default for QuickJsSandbox {
@@ -470,13 +492,8 @@ impl Drop for QuickJsSandbox {
     /// at shutdown — if any `Persistent` values outlive the runtime we hold
     /// live JS object references and the assertion fires.
     fn drop(&mut self) {
-        if let Ok(mut st) = self.state.lock() {
-            // Drop all Persistent resolve handles — this decrements their
-            // QuickJS reference count before the runtime shuts down.
-            st.pending.clear();
-            st.staged.clear();
-        }
-        // `runtime` and `context` are dropped in field order after this.
+        self.clear_js_roots();
+        // Fields then drop in declaration order: state, context, runtime.
     }
 }
 

@@ -7,7 +7,7 @@
 /// - A validator that inspects the `AgentRun` and returns Pass / Fail / Warn
 use auwgent_mode::ToolDefinition;
 
-use crate::agent::AgentRun;
+use crate::agent::{AgentRun, ScriptLanguage};
 
 pub mod basic;
 pub mod chained;
@@ -35,6 +35,12 @@ pub trait Scenario {
 
     /// The plain-English task description sent to the LLM.
     fn task(&self) -> &str;
+
+    /// Language-specific task text. Override when the default mentions Lua-only
+    /// constructs like `await_all()`.
+    fn task_for(&self, _language: ScriptLanguage) -> String {
+        self.task().to_string()
+    }
 
     /// Tool stubs available to the script for this scenario.
     fn tools(&self) -> Vec<ToolDefinition>;

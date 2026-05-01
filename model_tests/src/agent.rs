@@ -1,84 +1,127 @@
-/// Auwgent agent loop.
-///
-/// Handles the full lifecycle:
-///   1. Build system prompt from writing rules + tool descriptions
-///   2. Call Groq to get a Lua script via the `execute_lua_script` function call
-///   3. Execute the script in a fresh `AuwgentSandbox`
-///   4. Drive the yield loop — mock tool calls with the scenario dispatcher
-///   5. Return a fully-populated `AgentRun` for validation
+//! Auwgent live model test agent loop.
+
 use std::time::Instant;
 
-use auwgent_mode::{AuwgentSandbox, ExecutionResult, ToolCall, ToolDefinition, ToolResult};
+use auwgent_mode::{
+    AuwgentSandbox, ExecutionResult, QuickJsSandbox, ToolCall, ToolDefinition, ToolResult,
+};
 
 use crate::client::{GroqClient, Message};
 
-// ── Result types ──────────────────────────────────────────────────────────────
-
-/// Everything the validator needs to assess a completed agent run.
-#[derive(Debug)]
-pub struct AgentRun {
-    /// The raw Lua script the model produced.
-    pub lua_script: String,
-    /// Number of `YieldedForTools` rounds before `Finished`.
-    pub tool_rounds: usize,
-    /// Everything `print()`'d by the Lua script.
-    pub console_output: String,
-    /// The value the script explicitly `return`'d, if any.
-    pub ret_val: Option<String>,
-    /// Tool calls built but never passed to `await_all()`.
-    pub orphaned_calls: Vec<ToolCall>,
-    /// Wall-clock time from LLM call to `Finished`, in ms.
-    pub duration_ms: u128,
-    /// Set if either the API call or engine execution produced an error.
-    pub error: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptLanguage {
+    Lua,
+    JavaScript,
 }
 
-// ── Agent ─────────────────────────────────────────────────────────────────────
+impl ScriptLanguage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lua => "Lua",
+            Self::JavaScript => "JavaScript",
+        }
+    }
+
+    fn function_name(self) -> &'static str {
+        match self {
+            Self::Lua => "execute_lua_script",
+            Self::JavaScript => "execute_js_script",
+        }
+    }
+
+    fn tool_prompt(self, tools: &[ToolDefinition]) -> String {
+        match self {
+            Self::Lua => AuwgentSandbox::generate_tool_prompt(tools),
+            Self::JavaScript => QuickJsSandbox::generate_tool_prompt(tools),
+        }
+    }
+
+    fn system_prompt(self, tool_prompt: &str) -> String {
+        match self {
+            Self::Lua => format!(
+                "You are an AI agent using Auwgent Mode (a Lua sandbox).\n\
+                 When given a task, call `execute_lua_script` with a complete Lua script.\n\n\
+                 Rules:\n\
+                 - ALWAYS wrap every tool call in await_all(). Example:\n\
+                   `local r = await_all(get_weather({{ location = \"Lagos\" }}))`\n\
+                 - Never call a tool without await_all(); the call will be ignored.\n\
+                 - Use print() to expose results.\n\
+                 - Return a final value with `return` if the task demands a specific answer.\n\
+                 - Do NOT use os, io, require, or any external library.\n\n\
+                 Available tools (call inside your Lua script using await_all):\n\
+                 {tool_prompt}"
+            ),
+            Self::JavaScript => format!(
+                "You are an AI agent using Auwgent Mode (a QuickJS JavaScript sandbox).\n\
+                 When given a task, call `execute_js_script` with a complete JavaScript script.\n\n\
+                 Rules:\n\
+                 - Tool functions are async. ALWAYS await every tool call. Example:\n\
+                   `const r = await get_weather({{ location: \"Lagos\" }});`\n\
+                 - For independent tools, batch them with Promise.all(). Example:\n\
+                   `const [a, b] = await Promise.all([tool_a(), tool_b()]);`\n\
+                 - Use console.log() to expose final results.\n\
+                 - Do NOT use require, import, fetch, process, or host APIs.\n\n\
+                 Available tools (call inside your JavaScript script with await):\n\
+                 {tool_prompt}"
+            ),
+        }
+    }
+
+    fn function_description(self, tool_prompt: &str) -> String {
+        match self {
+            Self::Lua => format!(
+                "Submit a Lua script to the Auwgent sandbox to complete the task.\n\
+                 Use await_all() for every tool call.\n\n\
+                 Available tools:\n{tool_prompt}"
+            ),
+            Self::JavaScript => format!(
+                "Submit a JavaScript script to the QuickJS Auwgent sandbox to complete the task.\n\
+                 Use await for every tool call and Promise.all() for independent parallel tools.\n\n\
+                 Available tools:\n{tool_prompt}"
+            ),
+        }
+    }
+
+    fn body_description(self) -> &'static str {
+        match self {
+            Self::Lua => {
+                "Complete valid Lua script. Use await_all() for every tool call. Do not include explanation outside the script."
+            }
+            Self::JavaScript => {
+                "Complete valid JavaScript script for QuickJS. Use await for every tool call and console.log() for final output. Do not include explanation outside the script."
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AgentRun {
+    pub script: String,
+    pub tool_rounds: usize,
+    pub console_output: String,
+    pub ret_val: Option<String>,
+    pub orphaned_calls: Vec<ToolCall>,
+    pub duration_ms: u128,
+    pub error: Option<String>,
+}
 
 pub struct AuwgentAgent<'a> {
     pub client: &'a GroqClient,
     pub tools: Vec<ToolDefinition>,
-    /// Optional globals to inject into the sandbox before execution.
     pub globals: Option<serde_json::Value>,
+    pub language: ScriptLanguage,
 }
 
 impl<'a> AuwgentAgent<'a> {
-    /// Run a task end-to-end:
-    /// - Get Lua from the model via function calling
-    /// - Execute it in the sandbox, dispatching mocked tool results
-    /// - Return the full `AgentRun` for validation
     pub fn run(
         &self,
         user_task: &str,
         dispatcher: &dyn Fn(&str, &serde_json::Value) -> serde_json::Value,
     ) -> AgentRun {
         let start = Instant::now();
-
-        // Build the system prompt:
-        //   - Writing rules that constrain model behaviour
-        //   - Dynamic tool list from the scenario's registered tools
-        let tool_prompt = AuwgentSandbox::generate_tool_prompt(&self.tools);
-        let system = format!(
-            "You are an AI agent using Auwgent Mode (a Lua sandbox).\n\
-             When given a task, call `execute_lua_script` with a complete Lua script.\n\n\
-             Rules:\n\
-             - ALWAYS wrap every tool call in await_all(). Example:\n\
-               `local r = await_all(get_weather({{ location = \"Lagos\" }}))`\n\
-             - Never call a tool without await_all() — the call will be silently ignored.\n\
-             - Use print() to return your result that will be available to you for your next action.\n\
-             - Return a final value with `return` if the task demands a specific answer.\n\
-             - Do NOT use os, io, require, or any external library.\n\n\
-             Available tools (call inside your Lua script using await_all):\n\
-             {tool_prompt}"
-        );
-
-        // The description passed as the function's `description` field also
-        // carries the tool list so the model sees it in the function schema itself.
-        let fn_description = format!(
-            "Submit a Lua script to the Auwgent sandbox to complete the task.\n\
-             Use await_all() for every tool call.\n\n\
-             Available tools:\n{tool_prompt}"
-        );
+        let tool_prompt = self.language.tool_prompt(&self.tools);
+        let system = self.language.system_prompt(&tool_prompt);
+        let fn_description = self.language.function_description(&tool_prompt);
 
         let messages = vec![
             Message {
@@ -95,12 +138,16 @@ impl<'a> AuwgentAgent<'a> {
             },
         ];
 
-        // ── Step 1: get Lua from the model ────────────────────────────────────
-        let (lua_script, _call_id) = match self.client.get_lua_script(&messages, &fn_description) {
+        let (script, _call_id) = match self.client.get_script(
+            &messages,
+            self.language.function_name(),
+            &fn_description,
+            self.language.body_description(),
+        ) {
             Ok(pair) => pair,
             Err(e) => {
                 return AgentRun {
-                    lua_script: String::new(),
+                    script: String::new(),
                     tool_rounds: 0,
                     console_output: String::new(),
                     ret_val: None,
@@ -111,30 +158,64 @@ impl<'a> AuwgentAgent<'a> {
             }
         };
 
-        // ── Step 2: set up the sandbox ────────────────────────────────────────
+        match self.language {
+            ScriptLanguage::Lua => self.run_lua(script, start, dispatcher),
+            ScriptLanguage::JavaScript => self.run_js(script, start, dispatcher),
+        }
+    }
+
+    fn run_lua(
+        &self,
+        script: String,
+        start: Instant,
+        dispatcher: &dyn Fn(&str, &serde_json::Value) -> serde_json::Value,
+    ) -> AgentRun {
         let mut engine = AuwgentSandbox::new().unwrap();
         engine.register_tools(&self.tools).unwrap();
-
         if let Some(globals) = &self.globals {
             engine.inject_globals(globals.clone()).unwrap();
         }
 
-        // ── Step 3: drive the execution loop ──────────────────────────────────
-        let mut status = engine.execute(&lua_script).unwrap();
+        let mut status = match engine.execute(&script) {
+            Ok(status) => status,
+            Err(e) => {
+                return AgentRun {
+                    script,
+                    tool_rounds: 0,
+                    console_output: engine.get_console_output(),
+                    ret_val: None,
+                    orphaned_calls: Vec::new(),
+                    duration_ms: start.elapsed().as_millis(),
+                    error: Some(e.to_string()),
+                };
+            }
+        };
+
         let mut tool_rounds = 0usize;
 
         loop {
             match status {
                 ExecutionResult::YieldedForTools { ref tools } => {
                     tool_rounds += 1;
-
-                    // Dispatch every yielded tool through the scenario's mock dispatcher.
                     let results: Vec<ToolResult> = tools
                         .iter()
                         .map(|t| ToolResult::Ok(dispatcher(&t.tool_name, &t.payload)))
                         .collect();
 
-                    status = engine.resume_with_results(results).unwrap();
+                    match engine.resume_with_results(results) {
+                        Ok(next) => status = next,
+                        Err(e) => {
+                            return AgentRun {
+                                script,
+                                tool_rounds,
+                                console_output: engine.get_console_output(),
+                                ret_val: None,
+                                orphaned_calls: Vec::new(),
+                                duration_ms: start.elapsed().as_millis(),
+                                error: Some(e.to_string()),
+                            };
+                        }
+                    }
                 }
 
                 ExecutionResult::Finished {
@@ -143,7 +224,7 @@ impl<'a> AuwgentAgent<'a> {
                     orphaned_calls,
                 } => {
                     return AgentRun {
-                        lua_script,
+                        script,
                         tool_rounds,
                         console_output,
                         ret_val,
@@ -155,7 +236,91 @@ impl<'a> AuwgentAgent<'a> {
 
                 ExecutionResult::Error(e) => {
                     return AgentRun {
-                        lua_script,
+                        script,
+                        tool_rounds,
+                        console_output: engine.get_console_output(),
+                        ret_val: None,
+                        orphaned_calls: Vec::new(),
+                        duration_ms: start.elapsed().as_millis(),
+                        error: Some(e),
+                    };
+                }
+            }
+        }
+    }
+
+    fn run_js(
+        &self,
+        script: String,
+        start: Instant,
+        dispatcher: &dyn Fn(&str, &serde_json::Value) -> serde_json::Value,
+    ) -> AgentRun {
+        let mut engine = QuickJsSandbox::new().unwrap();
+        engine.register_tools(&self.tools).unwrap();
+        if let Some(globals) = &self.globals {
+            engine.inject_globals(globals.clone()).unwrap();
+        }
+
+        let mut status = match engine.execute(&script) {
+            Ok(status) => status,
+            Err(e) => {
+                return AgentRun {
+                    script,
+                    tool_rounds: 0,
+                    console_output: engine.get_console_output(),
+                    ret_val: None,
+                    orphaned_calls: Vec::new(),
+                    duration_ms: start.elapsed().as_millis(),
+                    error: Some(e.to_string()),
+                };
+            }
+        };
+        let mut tool_rounds = 0usize;
+
+        loop {
+            match status {
+                ExecutionResult::YieldedForTools { ref tools } => {
+                    tool_rounds += 1;
+                    let results: Vec<ToolResult> = tools
+                        .iter()
+                        .map(|t| ToolResult::Ok(dispatcher(&t.tool_name, &t.payload)))
+                        .collect();
+
+                    match engine.resume_with_results(results) {
+                        Ok(next) => status = next,
+                        Err(e) => {
+                            return AgentRun {
+                                script,
+                                tool_rounds,
+                                console_output: engine.get_console_output(),
+                                ret_val: None,
+                                orphaned_calls: Vec::new(),
+                                duration_ms: start.elapsed().as_millis(),
+                                error: Some(e.to_string()),
+                            };
+                        }
+                    }
+                }
+
+                ExecutionResult::Finished {
+                    ret_val,
+                    console_output,
+                    orphaned_calls,
+                } => {
+                    return AgentRun {
+                        script,
+                        tool_rounds,
+                        console_output,
+                        ret_val,
+                        orphaned_calls,
+                        duration_ms: start.elapsed().as_millis(),
+                        error: None,
+                    };
+                }
+
+                ExecutionResult::Error(e) => {
+                    return AgentRun {
+                        script,
                         tool_rounds,
                         console_output: engine.get_console_output(),
                         ret_val: None,

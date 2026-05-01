@@ -6,7 +6,7 @@
 /// - Output references the report or user name
 use auwgent_mode::ToolDefinition;
 
-use crate::agent::AgentRun;
+use crate::agent::{AgentRun, ScriptLanguage};
 use crate::scenarios::{make_tool, Scenario, ScenarioOutcome};
 
 pub struct ChainedScenario;
@@ -20,6 +20,18 @@ impl Scenario for ChainedScenario {
         "Fetch the user with ID 'usr_42'. \
          Then use their user ID to generate a summary report for them. \
          Print the report summary and return it."
+    }
+
+    fn task_for(&self, language: ScriptLanguage) -> String {
+        match language {
+            ScriptLanguage::Lua => self.task().to_string(),
+            ScriptLanguage::JavaScript => {
+                "Fetch the user with ID 'usr_42'. \
+                 Then use their user ID to generate a summary report for them. \
+                 Print the report summary with console.log()."
+                    .to_string()
+            }
+        }
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {

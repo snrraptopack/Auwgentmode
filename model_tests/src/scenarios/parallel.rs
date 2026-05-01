@@ -6,7 +6,7 @@
 /// - Warns if they ran in separate rounds (model chose sequential over parallel)
 use auwgent_mode::ToolDefinition;
 
-use crate::agent::AgentRun;
+use crate::agent::{AgentRun, ScriptLanguage};
 use crate::scenarios::{make_tool, Scenario, ScenarioOutcome};
 
 pub struct ParallelScenario;
@@ -19,6 +19,17 @@ impl Scenario for ParallelScenario {
     fn task(&self) -> &str {
         "Get the weather in Lagos AND the stock price of AAPL at the same time \
          using a single await_all() call. Print both results."
+    }
+
+    fn task_for(&self, language: ScriptLanguage) -> String {
+        match language {
+            ScriptLanguage::Lua => self.task().to_string(),
+            ScriptLanguage::JavaScript => {
+                "Get the weather in Lagos AND the stock price of AAPL at the same time \
+                 using a single Promise.all() call. Print both results with console.log()."
+                    .to_string()
+            }
+        }
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -61,13 +72,11 @@ impl Scenario for ParallelScenario {
         }
 
         if run.tool_rounds == 1 {
-            ScenarioOutcome::Pass(
-                "Both tools batched in one await_all() (true parallel yield)".into(),
-            )
+            ScenarioOutcome::Pass("Both tools batched in one parallel yield".into())
         } else {
             // Executed correctly but not batched — warn rather than fail
             ScenarioOutcome::Warn(format!(
-                "Tools ran in {} sequential rounds — model didn't batch them in one await_all()",
+                "Tools ran in {} sequential rounds; model didn't batch them",
                 run.tool_rounds
             ))
         }

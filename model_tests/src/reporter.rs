@@ -3,13 +3,14 @@ use colored::Colorize;
 
 use crate::scenarios::ScenarioOutcome;
 
-pub fn print_header(model: &str) {
+pub fn print_header(model: &str, engine: &str) {
     println!();
     println!("{}", "═".repeat(62).cyan());
     println!(
-        "  {}  [{}]",
+        "  {}  [{} | {}]",
         "Auwgent Model Tests".bold(),
-        model.yellow()
+        model.yellow(),
+        engine.yellow()
     );
     println!("{}", "═".repeat(62).cyan());
 }
@@ -20,7 +21,8 @@ pub fn print_result(
     tool_rounds: usize,
     orphans:     usize,
     duration_ms: u128,
-    verbose_lua: Option<&str>,
+    language:    &str,
+    verbose_script: Option<&str>,
 ) {
     let (badge, detail_str) = match outcome {
         ScenarioOutcome::Pass(msg) => (" PASS ".on_green().bold(),  msg.green().to_string()),
@@ -44,11 +46,14 @@ pub fn print_result(
     );
     println!("              {}", detail_str);
 
-    // In verbose mode, print the Lua the model wrote underneath
-    if let Some(lua) = verbose_lua {
+    // In verbose mode, print the script the model wrote underneath.
+    if let Some(script) = verbose_script {
         println!();
-        println!("{}", "  ── Generated Lua ──────────────────────────────────".dimmed());
-        for line in lua.lines() {
+        println!(
+            "{}",
+            format!("  -- Generated {language} --------------------------------").dimmed()
+        );
+        for line in script.lines() {
             println!("  {}", line.dimmed());
         }
         println!("{}", "  ────────────────────────────────────────────────────".dimmed());

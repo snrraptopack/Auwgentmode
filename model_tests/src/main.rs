@@ -7,10 +7,10 @@
 ///   cargo run -p model_tests                              # all scenarios, default model
 ///   cargo run -p model_tests -- --model openai/gpt-oss-120b
 ///   cargo run -p model_tests -- --scenario parallel --verbose
-///   cargo run -p model_tests -- --scenario orphan --rounds 5
+///   cargo run -p model_tests -- --engine js --scenario parallel --verbose
 use clap::Parser;
 
-use crate::agent::AuwgentAgent;
+use crate::agent::{AuwgentAgent, ScriptLanguage};
 use crate::client::GroqClient;
 use crate::reporter::{print_header, print_result, print_summary};
 use crate::scenarios::{all_scenarios, scenario_by_name, ScenarioOutcome};
@@ -40,9 +40,13 @@ struct Args {
     #[arg(long, short)]
     scenario: Option<String>,
 
-    /// Print the raw Lua script the model generated for each scenario
+    /// Print the raw script the model generated for each scenario
     #[arg(long, short)]
     verbose: bool,
+
+    /// Sandbox engine to test: lua | js
+    #[arg(long, default_value = "lua", value_parser = ["lua", "js"])]
+    engine: String,
 
     /// How many times to run each scenario (useful for orphan rate measurement)
     #[arg(long, short, default_value = "1")]
@@ -68,7 +72,12 @@ fn main() {
 
     let client = GroqClient::new(api_key, args.model.clone());
 
-    print_header(&args.model);
+    let language = match args.engine.as_str() {
+        "js" => ScriptLanguage::JavaScript,
+        _ => ScriptLanguage::Lua,
+    };
+
+    print_header(&args.model, language.label());
 
     // ── Resolve scenario list ─────────────────────────────────────────────────
     let scenarios = if let Some(name) = &args.scenario {
@@ -106,9 +115,11 @@ fn main() {
                 client:  &client,
                 tools:   scenario.tools(),
                 globals: scenario.globals(),
+                language,
             };
 
-            let run = agent.run(scenario.task(), &|name, payload| {
+            let task = scenario.task_for(language);
+            let run = agent.run(&task, &|name, payload| {
                 scenario.dispatch(name, payload)
             });
 
@@ -151,8 +162,8 @@ fn main() {
             ScenarioOutcome::Warn(_) => warn += 1,
         }
 
-        // Verbose: show the Lua only on the last run
-        let lua_display = if args.verbose { Some(run.lua_script.as_str()) } else { None };
+        // Verbose: show the generated script only on the last run
+        let script_display = if args.verbose { Some(run.script.as_str()) } else { None };
 
         print_result(
             scenario.name(),
@@ -160,7 +171,8 @@ fn main() {
             run.tool_rounds,
             run.orphaned_calls.len(),
             run.duration_ms,
-            lua_display,
+            language.label(),
+            script_display,
         );
     }
 

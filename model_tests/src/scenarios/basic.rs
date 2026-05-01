@@ -6,7 +6,7 @@
 /// - Output or return value references recognisable weather data
 use auwgent_mode::ToolDefinition;
 
-use crate::agent::AgentRun;
+use crate::agent::{AgentRun, ScriptLanguage};
 use crate::scenarios::{make_tool, Scenario, ScenarioOutcome};
 
 pub struct BasicScenario;
@@ -19,6 +19,17 @@ impl Scenario for BasicScenario {
     fn task(&self) -> &str {
         "What is the weather in Lagos right now? \
          Print the temperature and condition, then return the condition as a string."
+    }
+
+    fn task_for(&self, language: ScriptLanguage) -> String {
+        match language {
+            ScriptLanguage::Lua => self.task().to_string(),
+            ScriptLanguage::JavaScript => {
+                "What is the weather in Lagos right now? \
+                 Print the temperature and condition with console.log()."
+                    .to_string()
+            }
+        }
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -48,7 +59,7 @@ impl Scenario for BasicScenario {
         if !run.orphaned_calls.is_empty() {
             let names: Vec<&str> = run.orphaned_calls.iter().map(|c| c.tool_name.as_str()).collect();
             return ScenarioOutcome::Fail(format!(
-                "Model forgot await_all on: {}",
+                "Model forgot to await tool calls: {}",
                 names.join(", ")
             ));
         }

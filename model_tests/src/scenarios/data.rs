@@ -9,7 +9,7 @@
 /// - ret_val or console_output contains "20"
 use auwgent_mode::ToolDefinition;
 
-use crate::agent::AgentRun;
+use crate::agent::{AgentRun, ScriptLanguage};
 use crate::scenarios::{Scenario, ScenarioOutcome};
 
 pub struct DataScenario;
@@ -23,6 +23,18 @@ impl Scenario for DataScenario {
         "The numbers are available in the Lua global DATA (a table / array). \
          Sort them in descending order, remove duplicates, then return the sum of \
          the top 3 numbers as a string."
+    }
+
+    fn task_for(&self, language: ScriptLanguage) -> String {
+        match language {
+            ScriptLanguage::Lua => self.task().to_string(),
+            ScriptLanguage::JavaScript => {
+                "The numbers are available in the JavaScript global DATA (an array). \
+                 Sort them in descending order, remove duplicates, then console.log() \
+                 the sum of the top 3 numbers as a string."
+                    .to_string()
+            }
+        }
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {

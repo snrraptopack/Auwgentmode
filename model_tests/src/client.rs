@@ -46,7 +46,7 @@ struct FunctionDef {
     parameters:  serde_json::Value,
 }
 
-/// Force the model to always call our `execute_lua_script` function.
+/// Force the model to always call our script execution function.
 #[derive(Serialize)]
 struct ToolChoice {
     #[serde(rename = "type")]
@@ -56,7 +56,7 @@ struct ToolChoice {
 
 #[derive(Serialize)]
 struct FunctionName {
-    name: &'static str,
+    name: String,
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -106,27 +106,29 @@ impl GroqClient {
         }
     }
 
-    /// Call the Groq API with the `execute_lua_script` function forced.
+    /// Call the Groq API with the script execution function forced.
     ///
-    /// Returns `(lua_body, call_id)` where:
-    /// - `lua_body` is the Lua script the model wrote
+    /// Returns `(script_body, call_id)` where:
+    /// - `script_body` is the script the model wrote
     /// - `call_id` is the tool-call ID (needed for corrective feedback turns)
-    pub fn get_lua_script(
+    pub fn get_script(
         &self,
         messages:         &[Message],
+        function_name:    &str,
         tool_description: &str,
+        body_description: &str,
     ) -> Result<(String, String), String> {
         let execute_tool = Tool {
             tool_type: "function",
             function: FunctionDef {
-                name:        "execute_lua_script".to_string(),
+                name:        function_name.to_string(),
                 description: tool_description.to_string(),
                 parameters:  serde_json::json!({
                     "type": "object",
                     "properties": {
                         "body": {
                             "type": "string",
-                            "description": "Complete valid Lua script. Use await_all() for every tool call. Do not include explanation outside the script."
+                            "description": body_description
                         }
                     },
                     "required": ["body"]
@@ -140,7 +142,7 @@ impl GroqClient {
             tools:       vec![execute_tool],
             tool_choice: ToolChoice {
                 choice_type: "function",
-                function:    FunctionName { name: "execute_lua_script" },
+                function:    FunctionName { name: function_name.to_string() },
             },
             temperature: 0.0,
         };
@@ -177,11 +179,11 @@ impl GroqClient {
         let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
             .map_err(|e| format!("Failed to parse tool arguments: {e}"))?;
 
-        let lua_body = args["body"]
+        let script_body = args["body"]
             .as_str()
-            .ok_or_else(|| "execute_lua_script missing required `body` field".to_string())?
+            .ok_or_else(|| format!("{function_name} missing required `body` field"))?
             .to_string();
 
-        Ok((lua_body, tool_call.id))
+        Ok((script_body, tool_call.id))
     }
 }

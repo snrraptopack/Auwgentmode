@@ -1,8 +1,8 @@
 # Auwgent Mode
 
-A secure, high-performance in-process Lua execution sandbox for AI agents, written in Rust.
+A secure, high-performance in-process code execution sandbox for AI agents, written in Rust.
 
-Instead of forcing your LLM into slow, single-turn JSON tool calls, Auwgent Mode lets the model write a single block of Lua logic. The sandbox evaluates it in microseconds, routes tool calls to your Rust host, and feeds results back — all without a single LLM roundtrip during execution.
+Instead of forcing your LLM into slow, single-turn JSON tool calls, Auwgent Mode lets the model write a single block of sandboxed Lua/Luau or JavaScript logic. The sandbox evaluates it in-process, routes tool calls to your Rust host, and feeds results back - all without a single LLM roundtrip during execution.
 
 Inspired by [Pydantic's Monty](https://github.com/pydantic/monty). Built for production agentic systems.
 
@@ -12,11 +12,24 @@ Inspired by [Pydantic's Monty](https://github.com/pydantic/monty). Built for pro
 
 | Problem | Solution |
 |---|---|
-| LLMs call tools one at a time (slow) | `await_all()` batches tool calls into one yield |
-| Untrusted code can crash your host | Luau `sandbox(true)` + memory limits + instruction caps |
-| Tool results need extra LLM turns to process | Lua manipulates results natively in the sandbox |
+| LLMs call tools one at a time (slow) | Lua `await_all()` or JS `Promise.all()` batches tool calls into one yield |
+| Untrusted code can crash your host | Luau `sandbox(true)` / QuickJS isolation + memory limits + instruction caps |
+| Tool results need extra LLM turns to process | Lua or JavaScript manipulates results natively in the sandbox |
 | JSON tool schemas cause hallucinations | Named-parameter stubs generated per tool |
 | AI has no environment context | `inject_globals()` injects read-only agent variables |
+
+---
+
+## Engine Options
+
+Auwgent Mode currently exposes two sandbox engines with the same host-facing execution model:
+
+| Engine | Rust type | Model contract | Best fit |
+|---|---|---|---|
+| Luau/Lua | `AuwgentSandbox` / `LuauSandbox` | `await_all(tool(...))` | Existing Auwgent flows, strong coroutine semantics, orphan detection |
+| QuickJS/JavaScript | `QuickJsSandbox` | `await tool(...)` and `Promise.all([...])` | Models and users that naturally write JavaScript, familiar data manipulation |
+
+Both engines use the same shared types: `ToolDefinition`, `ExecutionResult`, `ToolResult`, `SandboxSnapshot`, and `ToolCall`. They also expose the same core methods: `register_tools()`, `inject_globals()`, `execute()`, `resume_with_json()`, `resume_with_results()`, `snapshot()`, and `from_snapshot()`.
 
 ---
 
@@ -139,6 +152,8 @@ serde_json = "1"
 
 ## Quick Start
 
+### Luau/Lua
+
 ```rust
 use auwgent_mode::{AuwgentSandbox, ExecutionResult, ToolDefinition};
 
@@ -209,11 +224,75 @@ fn main() {
 
 ---
 
+### QuickJS/JavaScript
+
+```rust
+use auwgent_mode::{ExecutionResult, QuickJsSandbox, ToolDefinition};
+
+fn main() {
+    // 1. Create the QuickJS sandbox
+    let mut engine = QuickJsSandbox::new().unwrap();
+
+    // 2. Register tools - auto-generates async JavaScript stubs
+    engine.register_tools(&[
+        ToolDefinition {
+            name: "get_weather".into(),
+            description: "Returns weather for a city".into(),
+            has_args: true,
+            arg_schema: Some("{ location: string }".into()),
+        },
+    ]).unwrap();
+
+    // 3. The LLM writes JavaScript with top-level await support
+    let script = r#"
+        const weather = await get_weather({ location: "Lagos" });
+        console.log("Condition:", weather.condition);
+    "#;
+
+    // 4. Drive the same host execution loop
+    let mut status = engine.execute(script).unwrap();
+    loop {
+        match status {
+            ExecutionResult::YieldedForTools { tools } => {
+                let responses: Vec<serde_json::Value> = tools
+                    .iter()
+                    .map(|t| match t.tool_name.as_str() {
+                        "get_weather" => serde_json::json!({
+                            "condition": "Sunny",
+                            "temp": "32C"
+                        }),
+                        _ => serde_json::json!({ "__error": true, "message": "unknown tool" }),
+                    })
+                    .collect();
+                status = engine.resume_with_json(responses).unwrap();
+            }
+            ExecutionResult::Finished { console_output, .. } => {
+                println!("Output:\n{}", console_output);
+                break;
+            }
+            ExecutionResult::Error(e) => panic!("{}", e),
+        }
+    }
+}
+```
+
+For independent JavaScript tool calls, ask the model to batch with `Promise.all()`:
+
+```javascript
+const [weather, stocks] = await Promise.all([
+    get_weather({ location: "NY" }),
+    get_stocks({ ticker: "AAPL" })
+]);
+console.log(weather.temp, stocks.price);
+```
+
+---
+
 ## Core Concepts
 
 ### The Execution Loop
 
-Every script runs inside a Lua coroutine. When the LLM calls `await_all(...)`, the coroutine **yields** — fully suspending the script. Your Rust application receives a `YieldedForTools` result, executes the tools (including async I/O), then calls `resume_with_json()` to wake the script back up with the results.
+Every Lua script runs inside a coroutine. When the LLM calls `await_all(...)`, the coroutine **yields** - fully suspending the script. JavaScript uses the same host-facing yield model through async tool promises: `await tool(...)` yields one tool call, and `Promise.all([...])` yields a batch. Your Rust application receives a `YieldedForTools` result, executes the tools (including async I/O), then calls `resume_with_json()` to wake the script back up with the results.
 
 ```
 LLM generates script once
@@ -240,7 +319,7 @@ The LLM is **not involved** during any of these steps. It wrote the script once 
 
 ### Parallel vs Sequential Tool Calls
 
-**Parallel** — call multiple tools in one yield:
+**Parallel in Lua** - call multiple tools in one yield:
 ```lua
 -- Both tools execute concurrently on the Rust side
 local weather, stocks = await_all(
@@ -250,7 +329,16 @@ local weather, stocks = await_all(
 print(weather.temp, stocks.price)
 ```
 
-**Sequential** — yield multiple times, using previous results:
+**Parallel in JavaScript** - call independent tools through one `Promise.all()`:
+```javascript
+const [weather, stocks] = await Promise.all([
+    get_weather({ location: "NY" }),
+    get_stocks({ ticker: "AAPL" })
+]);
+console.log(weather.temp, stocks.price);
+```
+
+**Sequential** - yield multiple times, using previous results:
 ```lua
 local user = await_all(fetch_user({ id = "123" }))
 
@@ -259,9 +347,17 @@ local report = await_all(generate_report({ user_id = user.id }))
 print(report.summary)
 ```
 
+JavaScript sequential calls use normal `await`:
+
+```javascript
+const user = await fetch_user({ id: "123" });
+const report = await generate_report({ user_id: user.id });
+console.log(report.summary);
+```
+
 ### Named Parameters (Single-Table Convention)
 
-All tools accept a **single table** of named arguments. This prevents positional-argument hallucinations and maps cleanly to JSON.
+All tools accept a **single table/object** of named arguments. This prevents positional-argument hallucinations and maps cleanly to JSON.
 
 ```lua
 --  Correct: named parameters in a table
@@ -273,7 +369,7 @@ local result = await_all(search("rust sandbox", 10))
 
 ### Console Output
 
-Everything `print()`'d by the LLM is captured in a Rust buffer and available in `ExecutionResult::Finished` as `console_output`. This is the **LLM's context channel** — it shows what the model's script did, step by step.
+Everything `print()`'d by Lua or `console.log()`'d by JavaScript is captured in a Rust buffer and available in `ExecutionResult::Finished` as `console_output`. This is the **LLM's context channel** - it shows what the model's script did, step by step.
 
 ```rust
 ExecutionResult::Finished { console_output, .. } => {
@@ -330,6 +426,8 @@ Scripts do not have to return anything. If no `return` is executed, `ret_val` is
 
 ## Full API Reference
 
+The examples in this section use `AuwgentSandbox` for Luau/Lua. `QuickJsSandbox` mirrors the same host API unless noted: `new()`, `register_tools()`, `generate_tool_prompt()`, `inject_globals()`, `execute()`, `resume_with_json()`, `resume_with_results()`, `get_console_output()`, `snapshot()`, and `from_snapshot()`.
+
 ### `AuwgentSandbox::new() -> LuaResult<Self>`
 
 Creates a secure Luau VM. The sandbox is **not locked** at this point — you can still register tools and inject globals.
@@ -345,11 +443,28 @@ Security guarantees applied at construction:
 - Memory capped at **20 MB**
 - Instruction interrupt installed (infinite loop protection)
 
+### `QuickJsSandbox::new() -> JsResult<Self>`
+
+Creates a QuickJS VM with the same host-controlled tool-yield protocol.
+
+```rust
+use auwgent_mode::QuickJsSandbox;
+
+let mut engine = QuickJsSandbox::new().unwrap();
+```
+
+QuickJS-specific behavior:
+- Tool stubs are async JavaScript functions.
+- Use `await tool({...})` for one tool call.
+- Use `Promise.all([tool_a(), tool_b()])` to batch independent calls.
+- `console.log()` is captured as `console_output`.
+- The runtime has a 20 MB memory limit and an interrupt handler for infinite-loop protection.
+
 ---
 
 ### `engine.register_tools(tools: &[ToolDefinition]) -> LuaResult<()>`
 
-Injects Lua function stubs for every tool. Must be called **before** `execute()`.
+Injects sandbox function stubs for every tool. In Lua these are plain functions that return intent tables; in JavaScript these are async functions that return Promises resolved by the host. Must be called **before** `execute()`.
 
 ```rust
 engine.register_tools(&[
@@ -379,6 +494,16 @@ end
 function get_timestamp()
     return { name = "get_timestamp" }
 end
+```
+
+The generated JavaScript stubs are used like:
+
+```javascript
+const weather = await get_weather({ location: "Lagos" });
+const [weather, stocks] = await Promise.all([
+    get_weather({ location: "Lagos" }),
+    get_stocks({ ticker: "AAPL" })
+]);
 ```
 
 ---
@@ -411,7 +536,7 @@ You have access to the following tools:
 
 ### `engine.inject_globals(ctx: serde_json::Value) -> LuaResult<()>`
 
-Injects read-only context variables into the Lua environment **before** the script runs. Must be called before `execute()`.
+Injects read-only context variables into the sandbox global environment **before** the script runs. Must be called before `execute()`.
 
 ```rust
 engine.inject_globals(serde_json::json!({
@@ -422,7 +547,7 @@ engine.inject_globals(serde_json::json!({
 })).unwrap();
 ```
 
-The LLM can then access these natively:
+The LLM can then access these natively. In Lua:
 ```lua
 print("Running as agent:", AGENT_ID)
 local report = await_all(save_report({
@@ -431,11 +556,21 @@ local report = await_all(save_report({
 }))
 ```
 
+In JavaScript:
+
+```javascript
+console.log("Running as agent:", AGENT_ID);
+const report = await save_report({
+    session: SESSION_ID,
+    path: WORKSPACE_PATH + "/report.txt"
+});
+```
+
 ---
 
 ### `engine.execute(script: &str) -> LuaResult<ExecutionResult>`
 
-Loads and starts executing a Lua script. On the **first call**, this locks the sandbox by applying `sandbox(true)` — freezing the global table so the LLM script cannot override tools or the `print` function.
+Loads and starts executing a Lua script. On the **first call**, this locks the sandbox by applying `sandbox(true)` - freezing the global table so the LLM script cannot override tools or the `print` function. For `QuickJsSandbox`, `execute()` wraps the source in an async IIFE so top-level `await` works.
 
 The instruction counter is **reset** on every `execute()` call, so re-using the engine for multiple sequential scripts is safe.
 
@@ -446,7 +581,7 @@ let result = engine.execute(llm_generated_script)?;
 Returns one of:
 - `ExecutionResult::Finished { ret_val, console_output, orphaned_calls }` — script ran to completion
 - `ExecutionResult::YieldedForTools { tools }` — script is paused waiting for tool results
-- `ExecutionResult::Error(String)` — non-recoverable Lua runtime error
+- `ExecutionResult::Error(String)` - non-recoverable sandbox runtime error
 
 See the [Orphan Detection](#orphaned-tool-detection) section for how to handle `orphaned_calls`.
 
@@ -454,7 +589,7 @@ See the [Orphan Detection](#orphaned-tool-detection) section for how to handle `
 
 ### `engine.resume_with_json(responses: Vec<serde_json::Value>) -> LuaResult<ExecutionResult>`
 
-Resumes a suspended script, injecting tool results back into the Lua coroutine. The order of `responses` must match the order of tools in the last `YieldedForTools`.
+Resumes a suspended script, injecting tool results back into the Lua coroutine or JavaScript promises. The order of `responses` must match the order of tools in the last `YieldedForTools`.
 
 Use this when **all tools are guaranteed to succeed**. For mixed success/failure batches, use `resume_with_results` instead.
 
@@ -480,8 +615,8 @@ ExecutionResult::YieldedForTools { tools } => {
 The production-grade alternative to `resume_with_json`. Accepts a mix of `ToolResult::Ok` and `ToolResult::Err` so the LLM can handle individual tool failures without crashing the entire script.
 
 **`ToolResult` variants:**
-- `ToolResult::Ok(serde_json::Value)` — injected as a normal Lua table
-- `ToolResult::Err(String)` — injected as `{ __error = true, message = "..." }`
+- `ToolResult::Ok(serde_json::Value)` - injected as a normal Lua table or JavaScript object
+- `ToolResult::Err(String)` - injected as `{ __error = true, message = "..." }` in Lua or `{ __error: true, message: "..." }` in JavaScript
 
 ```rust
 ExecutionResult::YieldedForTools { tools } => {
@@ -526,13 +661,15 @@ print("News:", news.headline)
 
 ### `engine.get_console_output() -> String`
 
-Returns everything `print()`'d so far in the current execution. Normally you read this from `ExecutionResult::Finished`, but this method lets you read it mid-execution if needed.
+Returns everything `print()`'d or `console.log()`'d so far in the current execution. Normally you read this from `ExecutionResult::Finished`, but this method lets you read it mid-execution if needed.
 
 ---
 
 ## Orphaned Tool Detection
 
-Some LLM models occasionally write a tool call **without** wrapping it in `await_all()`. Instead of silently discarding the call (and returning nothing to the script), the engine tracks it and surfaces the intent in `ExecutionResult::Finished` so the host can correct the model.
+Some LLM models occasionally write a Lua tool call **without** wrapping it in `await_all()`. Instead of silently discarding the call (and returning nothing to the script), the Luau engine tracks it and surfaces the intent in `ExecutionResult::Finished` so the host can correct the model.
+
+For JavaScript, prompt models to `await` every tool call or use `Promise.all()` for independent tools. Unawaited JavaScript promises are still visible to the QuickJS bridge as pending tool calls, but the most reliable contract for model behavior is explicit `await`.
 
 ```lua
 -- LLM bug: calls get_weather but forgets await_all
@@ -730,14 +867,33 @@ Library code is automatically stored in `SandboxSnapshot.libraries` and reloaded
 
 ## Security Model
 
-| Threat | Mitigation |
-|---|---|
-| File system access | `io`, `os` libraries not loaded |
-| External network calls | No socket/HTTP primitives available |
-| Infinite loops | Instruction interrupt fires every ~N ops; kills script after 100,000 pings |
-| Memory bombs | Hard 20 MB heap limit via mlua allocator hook |
-| Overriding `print`/`await_all` | `sandbox(true)` freezes globals before first execute |
-| Accessing host Rust state | All host data must be explicitly passed via `resume_with_json()` |
+| Threat | Luau mitigation | QuickJS mitigation |
+|---|---|---|
+| File system access | `io`, `os`, `package`, `debug` libraries not loaded | No host file APIs are exposed |
+| External network calls | No socket/HTTP primitives available | No `fetch`, `require`, imports, or host network APIs are exposed |
+| Infinite loops | Instruction interrupt kills runaway scripts | Runtime interrupt handler kills runaway scripts |
+| Memory bombs | Hard 20 MB heap limit via mlua allocator hook | Hard 20 MB QuickJS runtime memory limit |
+| Overriding host stubs | `sandbox(true)` freezes globals before first execute | Host only drains registered resolver queue and Rust-owned state |
+| Accessing host Rust state | All host data must be explicitly passed via `resume_with_json()` | Same: all host data must be explicitly passed via `resume_with_json()` |
+
+---
+
+## Live Model Tests
+
+The `model_tests` workspace member runs live Groq-backed model scenarios against either sandbox:
+
+```bash
+# Luau/Lua live tests (default)
+cargo run --release -p model_tests
+
+# QuickJS/JavaScript live tests
+cargo run --release -p model_tests -- --engine js
+
+# Inspect generated code
+cargo run --release -p model_tests -- --engine js --scenario parallel --verbose
+```
+
+The same scenario validators are used for both engines. Lua prompts require `await_all(...)`; JavaScript prompts require `await` and `Promise.all(...)`.
 
 ---
 
@@ -795,18 +951,66 @@ print("Electronics:", by_category["Electronics"])
 
 ---
 
+## JavaScript Patterns for Agents
+
+#### List Filtering
+```javascript
+const users = await get_users();
+const active = users.filter((u) => u.is_active);
+console.log("Active users:", active.length);
+```
+
+#### Sorting
+```javascript
+const products = await get_products();
+products.sort((a, b) => a.price - b.price);
+console.log("Cheapest:", products[0].name);
+```
+
+#### Aggregation
+```javascript
+const scores = await get_scores();
+const total = scores.reduce((sum, n) => sum + n, 0);
+console.log("Average:", total / scores.length);
+```
+
+#### Multi-Step Reasoning
+```javascript
+const user = await fetch_user({ id: USER_ID });
+const fullName = `${user.first} ${user.last}`;
+const recommendations = await recommend({ name: fullName, age: user.age });
+for (const item of recommendations) {
+    console.log("-", item.title);
+}
+```
+
+#### Parallel Tools
+```javascript
+const [weather, stocks] = await Promise.all([
+    get_weather({ location: "NY" }),
+    get_stocks({ ticker: "AAPL" })
+]);
+console.log(weather.condition, stocks.price);
+```
+
+---
+
 ## Project Structure
 
 ```
 Auwgentmode/
-├── src/
-│   ├── lib.rs          # Public exports
-│   ├── engine.rs       # Core sandbox implementation
-│   └── tests.rs        # Unit tests (security, API surface)
-├── tests/
-│   └── data_manipulation.rs  # Integration tests (list ops, data flows)
-├── Cargo.toml
-└── README.md
+|-- src/
+|   |-- lib.rs          # Public exports
+|   |-- luau_engine.rs  # Luau/Lua sandbox implementation
+|   |-- js_engine.rs    # QuickJS/JavaScript sandbox implementation
+|   |-- types.rs        # Shared public types
+|   `-- tests.rs        # Luau unit tests
+|-- tests/
+|   |-- js_sandbox.rs         # QuickJS integration tests
+|   `-- data_manipulation.rs  # Luau integration tests
+|-- model_tests/              # Live Groq model tests for Lua and JS
+|-- Cargo.toml
+`-- README.md
 ```
 
 ---
@@ -815,8 +1019,8 @@ Auwgentmode/
 
 The engine is designed to be extended, not modified. The recommended pattern is:
 
-1. Add new `ToolDefinition` variants — the engine handles stub generation automatically.
-2. Add new globals via `inject_globals()` — no engine changes needed.
-3. To add new security primitives (e.g. network rate limits), hook into the `resume_internal` method in `engine.rs`.
+1. Add new `ToolDefinition` variants - the engines handle stub generation automatically.
+2. Add new globals via `inject_globals()` - no engine changes needed.
+3. To add new security primitives (e.g. network rate limits), hook into the host dispatch layer or the relevant engine implementation.
 
 When adding features, ensure every new behaviour has a corresponding test in either `src/tests.rs` (unit) or `tests/` (integration).
